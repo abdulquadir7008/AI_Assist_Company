@@ -1,0 +1,22 @@
+{
+  "name": "company-rag-assistant",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace @company-rag/database && concurrently \"npm run dev --workspace @company-rag/web\" \"npm run dev --workspace @company-rag/api\"",
+    "build": "npm run build --workspace @company-rag/database && npm run build --workspace @company-rag/web && npm run build --workspace @company-rag/api",
+    "lint": "npm run lint --workspace @company-rag/web && npm run lint --workspace @company-rag/api",
+    "typecheck": "npm run typecheck --workspace @company-rag/database && npm run typecheck --workspace @company-rag/web && npm run typecheck --workspace @company-rag/api",
+    "prisma:generate": "prisma generate --schema packages/database/prisma/schema.prisma",
+    "prisma:migrate": "prisma migrate dev --schema packages/database/prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "prisma": "^5.22.0",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DocumentCategory {
+  HR_POLICY
+  PRODUCT
+  TECHNICAL
+  LEGAL
+  TRAINING
+  OTHER
+}
+
+enum DocumentStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum AiProvider {
+  OPENAI
+  HUGGINGFACE
+}
+
+enum Visibility {
+  COMPANY
+  SUPPORT
+  ENGINEERING
+  HR
+  LEGAL
+  LEADERSHIP
+}
+
+model Company {
+  id        String     @id @default(cuid())
+  name      String
+  slug      String     @unique
+  users     User[]
+  documents Document[]
+  questions Question[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model User {
+  id        String     @id @default(cuid())
+  email     String
+  name      String?
+  role      String     @default("employee")
+  companyId String
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  questions Question[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([companyId, email])
+}
+
+model Document {
+  id              String           @id @default(cuid())
+  companyId       String
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  title           String
+  originalName    String
+  mimeType        String
+  sizeBytes       Int
+  storagePath     String
+  category        DocumentCategory @default(OTHER)
+  visibility      Visibility       @default(COMPANY)
+  status          DocumentStatus   @default(UPLOADED)
+  failureReason   String?
+  chunks          DocumentChunk[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+model DocumentChunk {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  companyId  String
+  index      Int
+  content    String
+  tokenCount Int
+  chromaId   String   @unique
+  createdAt  DateTime @default(now())
+
+  @@index([companyId])
+  @@index([documentId])
+}
+
+model Question {
+  id         String     @id @default(cuid())
+  companyId  String
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  provider   AiProvider
+  question   String
+  answer     String
+  citations  Json
+  createdAt  DateTime   @default(now())
+
+  @@index([companyId])
+}
