@@ -1,4 +1,4 @@
-import { ChromaClient } from "chromadb";
+import { ChromaClient, type Where } from "chromadb";
 import { config } from "../config.js";
 import type { RetrievedChunk } from "../types.js";
 
@@ -25,16 +25,37 @@ export async function upsertChunks(input: {
   });
 }
 
+/**
+ * Metadata-only rewrite (no re-embedding) — used when a document or chunk is
+ * reclassified so the retrieval-layer ACL flags never go stale. Callers must
+ * pass the COMPLETE metadata dict per chunk.
+ */
+export async function updateChunkMetadata(input: {
+  ids: string[];
+  metadatas: ChunkMetadata[];
+}) {
+  const target = await collection();
+  await target.update({
+    ids: input.ids,
+    metadatas: input.metadatas
+  });
+}
+
+/**
+ * accessWhere is REQUIRED and must come from buildChromaAccessFilter — the
+ * access rule is enforced inside the similarity search itself, so chunks the
+ * requester cannot see are never retrieved, scored, or passed to the LLM.
+ */
 export async function queryChunks(input: {
   embedding: number[];
-  companyId: string;
+  accessWhere: Where;
   limit?: number;
 }): Promise<RetrievedChunk[]> {
   const target = await collection();
   const result = await target.query({
     queryEmbeddings: [input.embedding],
     nResults: input.limit ?? 6,
-    where: { companyId: input.companyId }
+    where: input.accessWhere
   });
 
   const ids = result.ids[0] ?? [];
@@ -48,6 +69,7 @@ export async function queryChunks(input: {
     const title = typeof metadata.title === "string" ? metadata.title : "Untitled document";
     return {
       chromaId: id,
+      chunkDbId: typeof metadata.chunkId === "string" ? metadata.chunkId : undefined,
       content: documents[index] ?? "",
       title,
       documentName: typeof metadata.documentName === "string" ? metadata.documentName : title,

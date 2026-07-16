@@ -4,25 +4,30 @@ import path from "node:path";
 import { prisma } from "@company-rag/database";
 import {
   AiProvider,
+  AuditAction,
+  Department,
   DocumentChunk,
   DocumentCategory,
   DocumentStatus,
   Prisma,
-  Visibility
+  Role
 } from "@company-rag/database";
 import express from "express";
 import multer from "multer";
 import { z } from "zod";
+import { buildChromaAccessFilter, canAccess } from "../access/policy.js";
 import { getAiClient } from "../ai/providers.js";
+import { audit } from "../audit/audit.js";
 import { config } from "../config.js";
 import { chunkBlocks, roughTokenCount } from "../rag/chunk.js";
-import { upsertChunks, queryChunks, ChunkMetadata } from "../rag/chroma.js";
+import { upsertChunks, queryChunks } from "../rag/chroma.js";
 import { composeAskResult } from "../rag/citations.js";
 import { extractText } from "../rag/extractText.js";
+import { buildChunkMetadata } from "../rag/metadata.js";
 import { buildAskPrompt } from "../rag/prompt.js";
 import type { AiProviderName, StoredCitations } from "../types.js";
 import { asyncHandler } from "./asyncHandler.js";
-import { getRequestContext } from "./context.js";
+import { getPrincipal, requireRole, HttpError } from "./auth.js";
 
 const router = express.Router();
 
@@ -46,10 +51,19 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024 }
 });
 
+// Multer delivers form fields as strings, so array fields arrive JSON-encoded.
+const jsonArray = <T extends z.ZodTypeAny>(inner: T) =>
+  z.preprocess(
+    (value) => (typeof value === "string" && value.length > 0 ? JSON.parse(value) : value),
+    z.array(inner)
+  );
+
 const documentSchema = z.object({
   title: z.string().min(1).optional(),
   category: z.nativeEnum(DocumentCategory).default(DocumentCategory.OTHER),
-  visibility: z.nativeEnum(Visibility).default(Visibility.COMPANY)
+  // Fail closed: a document uploaded without explicit access rules is admin-only.
+  allowedRoles: jsonArray(z.nativeEnum(Role)).default([Role.ADMIN]),
+  allowedDepartments: jsonArray(z.nativeEnum(Department)).default([])
 });
 
 const askSchema = z.object({
@@ -65,32 +79,43 @@ router.get("/health", (_request, response) => {
   response.json({ ok: true });
 });
 
+const demoUsers: { email: string; name: string; roles: Role[]; department: Department }[] = [
+  { email: "admin@demo-company.test", name: "Demo Admin", roles: [Role.ADMIN], department: Department.LEADERSHIP },
+  { email: "hr@demo-company.test", name: "Demo HR", roles: [Role.HR], department: Department.HR },
+  { email: "legal@demo-company.test", name: "Demo Legal", roles: [Role.LEGAL], department: Department.LEGAL },
+  { email: "employee@demo-company.test", name: "Demo Employee", roles: [Role.EMPLOYEE], department: Department.ENGINEERING },
+  { email: "contractor@demo-company.test", name: "Demo Contractor", roles: [Role.CONTRACTOR], department: Department.GENERAL }
+];
+
 router.post(
   "/setup/demo",
   asyncHandler(async (_request, response) => {
     const company = await prisma.company.upsert({
       where: { slug: "demo-company" },
       update: {},
-      create: {
-        name: "Demo Company",
-        slug: "demo-company",
-        users: {
-          create: {
-            email: "employee@demo-company.test",
-            name: "Demo Employee"
-          }
-        }
-      },
-      include: { users: true }
+      create: { name: "Demo Company", slug: "demo-company" }
     });
+
+    const users = [];
+    for (const demoUser of demoUsers) {
+      users.push(
+        await prisma.user.upsert({
+          where: { companyId_email: { companyId: company.id, email: demoUser.email } },
+          update: { roles: demoUser.roles, department: demoUser.department, name: demoUser.name },
+          create: { ...demoUser, companyId: company.id }
+        })
+      );
+    }
 
     response.json({
       companyId: company.id,
-      userId: company.users[0]?.id,
-      headers: {
-        "x-company-id": company.id,
-        "x-user-id": company.users[0]?.id
-      }
+      users: users.map((user) => ({
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        roles: user.roles,
+        department: user.department
+      }))
     });
   })
 );
@@ -98,9 +123,20 @@ router.post(
 router.get(
   "/documents",
   asyncHandler(async (request, response) => {
-    const { companyId } = getRequestContext(request);
+    const principal = getPrincipal(response);
+    // Existence is access-controlled too: non-admins only see documents their
+    // roles or department can read (same rule as canAccess, in Prisma terms).
+    const accessFilter = principal.roles.includes(Role.ADMIN)
+      ? {}
+      : {
+          OR: [
+            { allowedRoles: { hasSome: principal.roles } },
+            { allowedDepartments: { has: principal.department } }
+          ]
+        };
+
     const documents = await prisma.document.findMany({
-      where: { companyId },
+      where: { companyId: principal.companyId, ...accessFilter },
       orderBy: { createdAt: "desc" },
       include: { _count: { select: { chunks: true } } }
     });
@@ -111,9 +147,10 @@ router.get(
 
 router.post(
   "/documents",
+  requireRole(Role.ADMIN),
   upload.single("file"),
   asyncHandler(async (request, response) => {
-    const { companyId } = getRequestContext(request);
+    const principal = getPrincipal(response);
     const file = request.file;
     if (!file) {
       response.status(400).json({ error: "A document file is required." });
@@ -121,16 +158,23 @@ router.post(
     }
 
     const parsed = documentSchema.parse(request.body);
+    const explicitlyClassified =
+      request.body.allowedRoles !== undefined || request.body.allowedDepartments !== undefined;
+    const acl = { allowedRoles: parsed.allowedRoles, allowedDepartments: parsed.allowedDepartments };
+
     const document = await prisma.document.create({
       data: {
-        companyId,
+        companyId: principal.companyId,
         title: parsed.title || path.parse(file.originalname).name,
         originalName: file.originalname,
         mimeType: file.mimetype,
         sizeBytes: file.size,
         storagePath: file.path,
         category: parsed.category,
-        visibility: parsed.visibility,
+        allowedRoles: acl.allowedRoles,
+        allowedDepartments: acl.allowedDepartments,
+        classifiedAt: explicitlyClassified ? new Date() : null,
+        classifiedById: explicitlyClassified ? principal.userId : null,
         status: DocumentStatus.PROCESSING
       }
     });
@@ -150,7 +194,7 @@ router.post(
           prisma.documentChunk.create({
             data: {
               documentId: document.id,
-              companyId,
+              companyId: principal.companyId,
               index,
               content: chunk.content,
               tokenCount: roughTokenCount(chunk.content),
@@ -167,27 +211,21 @@ router.post(
         ids: createdChunks.map((chunk) => chunk.chromaId),
         embeddings,
         documents: chunks.map((chunk) => chunk.content),
-        metadatas: chunks.map((chunk, index): ChunkMetadata => ({
-          companyId,
-          documentId: document.id,
-          chunkId: createdChunks[index].id,
-          title: document.title,
-          category: document.category,
-          visibility: document.visibility,
-          documentName: document.originalName,
-          fileType: document.mimeType,
-          docUpdatedAt: document.updatedAt.toISOString(),
-          // Chroma rejects null metadata values, so absent keys are omitted.
-          ...(chunk.section !== undefined ? { section: chunk.section } : {}),
-          ...(chunk.pageStart !== undefined ? { pageStart: chunk.pageStart } : {}),
-          ...(chunk.pageEnd !== undefined ? { pageEnd: chunk.pageEnd } : {})
-        }))
+        metadatas: createdChunks.map((chunk) => buildChunkMetadata(document, chunk, acl))
       });
 
       const readyDocument = await prisma.document.update({
         where: { id: document.id },
         data: { status: DocumentStatus.READY },
         include: { _count: { select: { chunks: true } } }
+      });
+
+      await audit(principal, AuditAction.DOC_UPLOAD, {
+        documentId: document.id,
+        title: document.title,
+        allowedRoles: acl.allowedRoles,
+        allowedDepartments: acl.allowedDepartments,
+        explicitlyClassified
       });
 
       response.status(201).json({ document: readyDocument });
@@ -205,15 +243,18 @@ router.post(
 router.get(
   "/documents/:id/file",
   asyncHandler(async (request, response) => {
-    const { companyId } = getRequestContext(request);
+    const principal = getPrincipal(response);
     const document = await prisma.document.findFirst({
-      where: { id: request.params.id, companyId }
+      where: { id: request.params.id, companyId: principal.companyId }
     });
 
-    if (!document) {
-      response.status(404).json({ error: "Document not found." });
-      return;
+    // 404 for both "does not exist" and "not allowed" — existence of a
+    // restricted document must not be disclosed.
+    if (!document || !canAccess(principal, document)) {
+      throw new HttpError(404, "Document not found.");
     }
+
+    await audit(principal, AuditAction.DOC_DOWNLOAD, { documentId: document.id });
 
     const safeName = document.originalName.replace(/[^\w.\- ]/g, "_");
     response.setHeader("Content-Type", document.mimeType);
@@ -232,28 +273,43 @@ router.get(
 router.post(
   "/ask",
   asyncHandler(async (request, response) => {
-    const { companyId, userId } = getRequestContext(request);
+    const principal = getPrincipal(response);
     const parsed = askSchema.parse(request.body);
     const provider = selectedProvider(parsed.provider ?? config.defaultProvider);
     const ai = getAiClient(provider);
-    const [questionEmbedding] = await ai.embed([parsed.question]);
-    const chunks = await queryChunks({ embedding: questionEmbedding, companyId, limit: 6 });
     const providerEnum = provider === "huggingface" ? AiProvider.HUGGINGFACE : AiProvider.OPENAI;
 
-    // Nothing retrieved: answer without calling the LLM so nothing can be fabricated.
+    // Access control is enforced inside the vector query: the filter is part
+    // of the similarity search, so unauthorized chunks are never retrieved.
+    const accessWhere = buildChromaAccessFilter(principal);
+    const [questionEmbedding] = await ai.embed([parsed.question]);
+    const chunks = accessWhere
+      ? await queryChunks({ embedding: questionEmbedding, accessWhere, limit: 6 })
+      : [];
+
+    // Nothing retrieved — because nothing matched OR nothing was authorized.
+    // The response is identical in both cases, so restricted content's
+    // existence is never disclosed. No LLM call: nothing can be fabricated.
     if (chunks.length === 0) {
       const answer =
         "I don't have any company documents that cover this question. Try uploading the relevant document or asking the document owner.";
       const citations: StoredCitations = { version: 2, grounded: false, sources: [], retrieved: [] };
       const saved = await prisma.question.create({
         data: {
-          companyId,
-          userId,
+          companyId: principal.companyId,
+          userId: principal.userId,
           provider: providerEnum,
           question: parsed.question,
           answer,
           citations: citations as unknown as Prisma.InputJsonValue
         }
+      });
+
+      await audit(principal, AuditAction.ASK, {
+        question: parsed.question,
+        questionId: saved.id,
+        retrievedChunkIds: [],
+        citedChunkIds: []
       });
 
       response.json({ answer, sources: [], grounded: false, questionId: saved.id });
@@ -272,13 +328,20 @@ router.post(
 
     const saved = await prisma.question.create({
       data: {
-        companyId,
-        userId,
+        companyId: principal.companyId,
+        userId: principal.userId,
         provider: providerEnum,
         question: parsed.question,
         answer: result.answer,
         citations: citations as unknown as Prisma.InputJsonValue
       }
+    });
+
+    await audit(principal, AuditAction.ASK, {
+      question: parsed.question,
+      questionId: saved.id,
+      retrievedChunkIds: chunks.map((chunk) => chunk.chunkDbId ?? chunk.chromaId),
+      citedChunkIds: result.sources.map((source) => source.chunkId)
     });
 
     response.json({
@@ -293,9 +356,15 @@ router.post(
 router.get(
   "/questions",
   asyncHandler(async (request, response) => {
-    const { companyId } = getRequestContext(request);
+    const principal = getPrincipal(response);
+    // History is per-user: a question's answer may embed content from
+    // documents the reader cannot access. Admins may widen the scope.
+    const isAdmin = principal.roles.includes(Role.ADMIN);
+    const requestedUserId = typeof request.query.userId === "string" ? request.query.userId : undefined;
+    const userFilter = isAdmin ? (requestedUserId ? { userId: requestedUserId } : {}) : { userId: principal.userId };
+
     const questions = await prisma.question.findMany({
-      where: { companyId },
+      where: { companyId: principal.companyId, ...userFilter },
       orderBy: { createdAt: "desc" },
       take: 25
     });

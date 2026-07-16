@@ -17,6 +17,8 @@ export type ChunkWithMeta = {
 
 export type RetrievedChunk = {
   chromaId: string;
+  /** Postgres DocumentChunk id (from Chroma metadata) — used for audit logs. */
+  chunkDbId?: string;
   content: string;
   title: string;
   documentName: string;

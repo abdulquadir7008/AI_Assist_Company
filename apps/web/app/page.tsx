@@ -2,10 +2,14 @@
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ApiError,
   askQuestion,
   CompanyDocument,
+  DemoUser,
+  DepartmentName,
   downloadDocument,
   listDocuments,
+  Role,
   setupDemo,
   Source,
   TenantContext,
@@ -22,9 +26,12 @@ import {
   Search,
   Send,
   ShieldCheck,
-  UploadCloud
+  UploadCloud,
+  UserRound,
+  Wrench
 } from "lucide-react";
 import clsx from "clsx";
+import Link from "next/link";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -42,7 +49,18 @@ const categories = [
   "OTHER"
 ] as const;
 
-const visibilities = ["COMPANY", "SUPPORT", "ENGINEERING", "HR", "LEGAL", "LEADERSHIP"] as const;
+const allRoles: Role[] = ["ADMIN", "HR", "LEGAL", "MANAGER", "EMPLOYEE", "CONTRACTOR"];
+const allDepartments: DepartmentName[] = [
+  "GENERAL",
+  "ENGINEERING",
+  "HR",
+  "LEGAL",
+  "SALES",
+  "SUPPORT",
+  "LEADERSHIP"
+];
+
+const contextStorageKey = "company-rag-context-v2";
 
 export default function Home() {
   const [context, setContext] = useState<TenantContext | null>(null);
@@ -56,7 +74,8 @@ export default function Home() {
   const [provider, setProvider] = useState<"openai" | "huggingface">("openai");
   const [question, setQuestion] = useState("");
   const [category, setCategory] = useState<(typeof categories)[number]>("HR_POLICY");
-  const [visibility, setVisibility] = useState<(typeof visibilities)[number]>("COMPANY");
+  const [uploadRoles, setUploadRoles] = useState<Role[]>([]);
+  const [uploadDepartments, setUploadDepartments] = useState<DepartmentName[]>([]);
   const [title, setTitle] = useState("");
   const [uploading, setUploading] = useState(false);
   const [answering, setAnswering] = useState(false);
@@ -86,12 +105,15 @@ export default function Home() {
   }
 
   useEffect(() => {
-    const cached = window.localStorage.getItem("company-rag-context");
+    const cached = window.localStorage.getItem(contextStorageKey);
 
     async function boot() {
       try {
-        const activeContext = cached ? (JSON.parse(cached) as TenantContext) : await setupDemo();
-        window.localStorage.setItem("company-rag-context", JSON.stringify(activeContext));
+        let activeContext = cached ? (JSON.parse(cached) as TenantContext) : await setupDemo();
+        if (!activeContext.users?.length) {
+          activeContext = await setupDemo();
+        }
+        window.localStorage.setItem(contextStorageKey, JSON.stringify(activeContext));
         setContext(activeContext);
         await refreshDocuments(activeContext);
       } catch (caught) {
@@ -101,6 +123,24 @@ export default function Home() {
 
     void boot();
   }, []);
+
+  const activeUser = useMemo(
+    () => context?.users.find((user) => user.id === context.userId),
+    [context]
+  );
+  const isAdmin = activeUser?.roles.includes("ADMIN") ?? false;
+
+  async function switchPersona(userId: string) {
+    if (!context) {
+      return;
+    }
+    const nextContext = { ...context, userId };
+    window.localStorage.setItem(contextStorageKey, JSON.stringify(nextContext));
+    setContext(nextContext);
+    setError(null);
+    // Permissions changed: refetch what this persona is allowed to see.
+    await refreshDocuments(nextContext);
+  }
 
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -116,11 +156,18 @@ export default function Home() {
     formData.set("file", file);
     formData.set("title", title);
     formData.set("category", category);
-    formData.set("visibility", visibility);
+    // Multipart fields are strings, so ACL arrays travel JSON-encoded.
+    // Leaving both empty omits the fields → server defaults to admin-only.
+    if (uploadRoles.length > 0 || uploadDepartments.length > 0) {
+      formData.set("allowedRoles", JSON.stringify(uploadRoles));
+      formData.set("allowedDepartments", JSON.stringify(uploadDepartments));
+    }
 
     try {
       await uploadDocument(context, formData);
       setTitle("");
+      setUploadRoles([]);
+      setUploadDepartments([]);
       if (fileRef.current) {
         fileRef.current.value = "";
       }
@@ -169,6 +216,10 @@ export default function Home() {
     try {
       await downloadDocument(context, documentId, filename);
     } catch (caught) {
+      if (caught instanceof ApiError && (caught.status === 403 || caught.status === 404)) {
+        setError("This document is not available to your current role.");
+        return;
+      }
       setError(caught instanceof Error ? caught.message : "Download failed.");
     }
   }
@@ -188,10 +239,36 @@ export default function Home() {
               <p className="text-sm text-muted">RAG workspace for internal company knowledge</p>
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-2 text-sm">
-            <Metric icon={Building2} label="Workspace" value={context ? "Ready" : "Starting"} />
-            <Metric icon={FileText} label="Docs" value={String(documents.length)} />
-            <Metric icon={Search} label="Indexed" value={String(readyCount)} />
+          <div className="flex flex-col gap-2 md:items-end">
+            <div className="grid grid-cols-3 gap-2 text-sm">
+              <Metric icon={Building2} label="Workspace" value={context ? "Ready" : "Starting"} />
+              <Metric icon={FileText} label="Docs" value={String(documents.length)} />
+              <Metric icon={Search} label="Indexed" value={String(readyCount)} />
+            </div>
+            <div className="flex items-center gap-2">
+              <UserRound className="h-4 w-4 text-muted" aria-hidden="true" />
+              <select
+                value={context?.userId ?? ""}
+                onChange={(event) => void switchPersona(event.target.value)}
+                className="rounded border border-line px-2 py-1.5 text-sm outline-none focus:border-accent"
+                title="Switch demo persona"
+              >
+                {(context?.users ?? []).map((user) => (
+                  <option key={user.id} value={user.id}>
+                    {user.email} · {user.roles.join("+")} · {user.department}
+                  </option>
+                ))}
+              </select>
+              {isAdmin ? (
+                <Link
+                  href="/admin"
+                  className="flex items-center gap-1.5 rounded border border-line px-2 py-1.5 text-sm text-muted hover:border-accent hover:text-accent"
+                >
+                  <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
+                  Admin
+                </Link>
+              ) : null}
+            </div>
           </div>
         </div>
       </header>
@@ -214,6 +291,11 @@ export default function Home() {
               </button>
             </div>
 
+            {!isAdmin ? (
+              <p className="rounded border border-dashed border-line p-3 text-xs text-muted">
+                Only admins can upload documents. Switch to the admin persona to add content.
+              </p>
+            ) : (
             <form className="space-y-3" onSubmit={onUpload}>
               <input
                 ref={fileRef}
@@ -227,30 +309,68 @@ export default function Home() {
                 placeholder="Document title"
                 className="w-full rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
               />
-              <div className="grid grid-cols-2 gap-3">
-                <select
-                  value={category}
-                  onChange={(event) => setCategory(event.target.value as typeof category)}
-                  className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
-                >
-                  {categories.map((item) => (
-                    <option key={item} value={item}>
-                      {item.replace("_", " ")}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={visibility}
-                  onChange={(event) => setVisibility(event.target.value as typeof visibility)}
-                  className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
-                >
-                  {visibilities.map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <select
+                value={category}
+                onChange={(event) => setCategory(event.target.value as typeof category)}
+                className="w-full rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+              >
+                {categories.map((item) => (
+                  <option key={item} value={item}>
+                    {item.replace("_", " ")}
+                  </option>
+                ))}
+              </select>
+              <fieldset className="rounded border border-line p-3">
+                <legend className="px-1 text-xs font-semibold text-muted">
+                  Who can access this document?
+                </legend>
+                <p className="mb-2 text-xs text-muted">
+                  Leave everything unchecked to keep it admin-only until classified.
+                </p>
+                <div className="mb-2">
+                  <p className="mb-1 text-xs font-medium text-ink">Roles</p>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1">
+                    {allRoles.map((role) => (
+                      <label key={role} className="flex items-center gap-1 text-xs text-ink">
+                        <input
+                          type="checkbox"
+                          checked={role === "ADMIN" || uploadRoles.includes(role)}
+                          disabled={role === "ADMIN"}
+                          onChange={(event) =>
+                            setUploadRoles((current) =>
+                              event.target.checked
+                                ? [...current, role]
+                                : current.filter((item) => item !== role)
+                            )
+                          }
+                        />
+                        {role}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="mb-1 text-xs font-medium text-ink">Departments</p>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1">
+                    {allDepartments.map((department) => (
+                      <label key={department} className="flex items-center gap-1 text-xs text-ink">
+                        <input
+                          type="checkbox"
+                          checked={uploadDepartments.includes(department)}
+                          onChange={(event) =>
+                            setUploadDepartments((current) =>
+                              event.target.checked
+                                ? [...current, department]
+                                : current.filter((item) => item !== department)
+                            )
+                          }
+                        />
+                        {department}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </fieldset>
               <button
                 type="submit"
                 disabled={uploading || !context}
@@ -264,6 +384,7 @@ export default function Home() {
                 Upload
               </button>
             </form>
+            )}
           </div>
 
           <div className="rounded border border-line bg-white shadow-panel">

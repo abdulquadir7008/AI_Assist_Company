@@ -28,6 +28,8 @@ enum AiProvider {
   HUGGINGFACE
 }
 
+// Deprecated: superseded by Document.allowedRoles/allowedDepartments.
+// Kept only as a classification hint for pre-RBAC documents in the admin UI.
 enum Visibility {
   COMPANY
   SUPPORT
@@ -37,6 +39,34 @@ enum Visibility {
   LEADERSHIP
 }
 
+enum Role {
+  ADMIN
+  HR
+  LEGAL
+  MANAGER
+  EMPLOYEE
+  CONTRACTOR
+}
+
+enum Department {
+  GENERAL
+  ENGINEERING
+  HR
+  LEGAL
+  SALES
+  SUPPORT
+  LEADERSHIP
+}
+
+enum AuditAction {
+  ASK
+  DOC_UPLOAD
+  DOC_DOWNLOAD
+  ROLE_CHANGE
+  RECLASSIFY
+  CHUNK_RECLASSIFY
+}
+
 model Company {
   id        String     @id @default(cuid())
   name      String
@@ -44,20 +74,22 @@ model Company {
   users     User[]
   documents Document[]
   questions Question[]
+  auditLogs AuditLog[]
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
 }
 
 model User {
-  id        String     @id @default(cuid())
-  email     String
-  name      String?
-  role      String     @default("employee")
-  companyId String
-  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  questions Question[]
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
+  id         String     @id @default(cuid())
+  email      String
+  name       String?
+  roles      Role[]     @default([EMPLOYEE])
+  department Department @default(GENERAL)
+  companyId  String
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  questions  Question[]
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
 
   @@unique([companyId, email])
 }
@@ -73,6 +105,11 @@ model Document {
   storagePath     String
   category        DocumentCategory @default(OTHER)
   visibility      Visibility       @default(COMPANY)
+  // Access control: fail closed — a document nobody classified is admin-only.
+  allowedRoles       Role[]       @default([ADMIN])
+  allowedDepartments Department[] @default([])
+  classifiedAt       DateTime?
+  classifiedById     String?
   status          DocumentStatus   @default(UPLOADED)
   failureReason   String?
   chunks          DocumentChunk[]
@@ -91,6 +128,11 @@ model DocumentChunk {
   section    String?
   pageStart  Int?
   pageEnd    Int?
+  // Chunk-level ACL override for mixed-sensitivity documents.
+  // aclOverride distinguishes "inherit from document" from "override to nobody".
+  aclOverride         Boolean      @default(false)
+  overrideRoles       Role[]       @default([])
+  overrideDepartments Department[] @default([])
   chromaId   String   @unique
   createdAt  DateTime @default(now())
 
@@ -111,4 +153,18 @@ model Question {
   createdAt  DateTime   @default(now())
 
   @@index([companyId])
+}
+
+model AuditLog {
+  id            String      @id @default(cuid())
+  companyId     String
+  company       Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userId        String?
+  rolesSnapshot Role[]
+  department    Department?
+  action        AuditAction
+  detail        Json
+  createdAt     DateTime    @default(now())
+
+  @@index([companyId, createdAt])
 }
