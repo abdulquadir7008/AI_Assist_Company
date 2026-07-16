@@ -4,12 +4,14 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   askQuestion,
   CompanyDocument,
-  Citation,
+  downloadDocument,
   listDocuments,
   setupDemo,
+  Source,
   TenantContext,
   uploadDocument
 } from "../lib/api";
+import { AnswerWithSources } from "../components/AnswerWithSources";
 import {
   Bot,
   Building2,
@@ -27,7 +29,8 @@ import clsx from "clsx";
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
-  citations?: Citation[];
+  sources?: Source[];
+  grounded?: boolean;
 };
 
 const categories = [
@@ -145,12 +148,28 @@ export default function Home() {
       const result = await askQuestion(context, { question: trimmed, provider });
       setMessages((current) => [
         ...current,
-        { role: "assistant", content: result.answer, citations: result.citations }
+        {
+          role: "assistant",
+          content: result.answer,
+          sources: result.sources,
+          grounded: result.grounded
+        }
       ]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Question failed.");
     } finally {
       setAnswering(false);
+    }
+  }
+
+  async function onDownload(documentId: string, filename: string) {
+    if (!context) {
+      return;
+    }
+    try {
+      await downloadDocument(context, documentId, filename);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Download failed.");
     }
   }
 
@@ -339,19 +358,17 @@ export default function Home() {
                       : "border-line bg-paper text-ink"
                   )}
                 >
-                  <p className="whitespace-pre-wrap">{message.content}</p>
-                  {message.citations?.length ? (
-                    <div className="mt-3 flex flex-wrap gap-2 border-t border-line pt-3">
-                      {message.citations.map((citation) => (
-                        <span
-                          key={citation.chunkId}
-                          className="rounded border border-line bg-white px-2 py-1 text-xs text-muted"
-                        >
-                          {citation.title}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
+                  {message.role === "assistant" ? (
+                    <AnswerWithSources
+                      content={message.content}
+                      sources={message.sources ?? []}
+                      grounded={message.grounded ?? true}
+                      messageIndex={index}
+                      onDownload={(documentId, filename) => void onDownload(documentId, filename)}
+                    />
+                  ) : (
+                    <p className="whitespace-pre-wrap">{message.content}</p>
+                  )}
                 </div>
               </div>
             ))}

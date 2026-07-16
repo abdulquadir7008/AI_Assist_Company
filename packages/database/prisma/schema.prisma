@@ -88,6 +88,9 @@ model DocumentChunk {
   index      Int
   content    String
   tokenCount Int
+  section    String?
+  pageStart  Int?
+  pageEnd    Int?
   chromaId   String   @unique
   createdAt  DateTime @default(now())
 

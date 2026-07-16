@@ -2,21 +2,15 @@ import OpenAI from "openai";
 import { config } from "../config.js";
 import type { AiProviderName } from "../types.js";
 
-export type AiClient = {
-  embed(texts: string[]): Promise<number[][]>;
-  answer(question: string, context: string): Promise<string>;
+export type ChatPrompt = {
+  system: string;
+  user: string;
 };
 
-const groundedPrompt = (question: string, context: string) => `
-You are a private company assistant. Answer only from the provided company context.
-If the context does not contain the answer, say you do not know and suggest which internal team or document owner to ask.
-
-Context:
-${context}
-
-Question:
-${question}
-`;
+export type AiClient = {
+  embed(texts: string[]): Promise<number[][]>;
+  answer(prompt: ChatPrompt): Promise<string>;
+};
 
 class OpenAiClient implements AiClient {
   private client = new OpenAI({ apiKey: config.openai.apiKey });
@@ -34,7 +28,7 @@ class OpenAiClient implements AiClient {
     return response.data.map((item) => item.embedding);
   }
 
-  async answer(question: string, context: string) {
+  async answer(prompt: ChatPrompt) {
     if (!config.openai.apiKey) {
       throw new Error("OPENAI_API_KEY is required for OpenAI chat.");
     }
@@ -43,12 +37,8 @@ class OpenAiClient implements AiClient {
       model: config.openai.chatModel,
       temperature: 0.2,
       messages: [
-        {
-          role: "system",
-          content:
-            "You answer employee questions using private company documents. Be concise, accurate, and cite source titles when helpful."
-        },
-        { role: "user", content: groundedPrompt(question, context) }
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user }
       ]
     });
 
@@ -101,7 +91,7 @@ class HuggingFaceClient implements AiClient {
     return result as number[][];
   }
 
-  async answer(question: string, context: string) {
+  async answer(prompt: ChatPrompt) {
     if (!config.huggingFace.apiKey) {
       throw new Error("HUGGINGFACE_API_KEY is required for Hugging Face chat.");
     }
@@ -111,12 +101,8 @@ class HuggingFaceClient implements AiClient {
       max_tokens: 600,
       temperature: 0.2,
       messages: [
-        {
-          role: "system",
-          content:
-            "You answer employee questions using private company documents. Be concise, accurate, and cite source titles when helpful."
-        },
-        { role: "user", content: groundedPrompt(question, context) }
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user }
       ]
     })) as { choices?: { message?: { content?: string } }[] };
 

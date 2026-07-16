@@ -15,11 +15,16 @@ export type CompanyDocument = {
   _count?: { chunks: number };
 };
 
-export type Citation = {
+export type Source = {
+  id: number;
   documentId: string;
-  title: string;
-  category: string;
   chunkId: string;
+  document: string;
+  section: string | null;
+  page: number | null;
+  page_end: number | null;
+  last_updated: string | null;
+  category: string;
 };
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -76,5 +81,32 @@ export async function askQuestion(
   if (!response.ok) {
     throw new Error(body.error ?? "Question failed.");
   }
-  return body as Promise<{ answer: string; citations: Citation[]; questionId: string }>;
+  return body as Promise<{
+    answer: string;
+    sources: Source[];
+    grounded: boolean;
+    questionId: string;
+  }>;
+}
+
+export async function downloadDocument(
+  context: TenantContext,
+  documentId: string,
+  filename: string
+) {
+  // Tenant auth travels in headers, so a plain <a href> download won't work.
+  const response = await fetch(`${apiUrl}/api/documents/${documentId}/file`, {
+    headers: headers(context)
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.error ?? "Could not download document.");
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
