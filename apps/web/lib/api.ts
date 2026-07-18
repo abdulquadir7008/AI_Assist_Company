@@ -1,25 +1,15 @@
-export type Role = "ADMIN" | "HR" | "LEGAL" | "MANAGER" | "EMPLOYEE" | "CONTRACTOR";
-export type DepartmentName =
-  | "GENERAL"
-  | "ENGINEERING"
-  | "HR"
-  | "LEGAL"
-  | "SALES"
-  | "SUPPORT"
-  | "LEADERSHIP";
+import type { DepartmentName, Role, SessionUser } from "./session";
 
-export type DemoUser = {
+export type { DepartmentName, Role, SessionUser };
+
+export type CompanyUser = {
   id: string;
   email: string;
   name: string | null;
   roles: Role[];
   department: DepartmentName;
-};
-
-export type TenantContext = {
-  companyId: string;
-  userId?: string;
-  users: DemoUser[];
+  emailVerifiedAt?: string | null;
+  mustChangePassword?: boolean;
 };
 
 export type CompanyDocument = {
@@ -91,10 +81,29 @@ export type AuditEntry = {
   createdAt: string;
 };
 
+export type RootCompany = {
+  id: string;
+  name: string;
+  slug: string;
+  status: "PENDING_VERIFICATION" | "ACTIVE" | "SUSPENDED";
+  userCount: number;
+  documentCount: number;
+  createdAt: string;
+};
+
+export type RootCompanyUser = {
+  id: string;
+  email: string;
+  name: string | null;
+  emailVerifiedAt: string | null;
+  createdAt: string;
+};
+
 export class ApiError extends Error {
   constructor(
     public status: number,
-    message: string
+    message: string,
+    public code?: string
   ) {
     super(message);
   }
@@ -102,51 +111,112 @@ export class ApiError extends Error {
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
-function headers(context?: TenantContext) {
-  return {
-    ...(context?.companyId ? { "x-company-id": context.companyId } : {}),
-    ...(context?.userId ? { "x-user-id": context.userId } : {})
-  };
+function bearer(token: string) {
+  return { Authorization: `Bearer ${token}` };
 }
 
 async function parseOrThrow<T>(response: Response, fallbackMessage: string): Promise<T> {
   const body = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new ApiError(response.status, body?.error ?? fallbackMessage);
+    throw new ApiError(response.status, body?.error ?? fallbackMessage, body?.code);
   }
   return body as T;
 }
 
-export async function setupDemo(): Promise<TenantContext> {
-  const response = await fetch(`${apiUrl}/api/setup/demo`, { method: "POST" });
-  const body = await parseOrThrow<{ companyId: string; users: DemoUser[] }>(
+// ---- Onboarding / session ----
+
+export async function register(payload: {
+  companyName: string;
+  userName: string;
+  email: string;
+  password: string;
+}) {
+  const response = await fetch(`${apiUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ ok: true; email: string; message: string; devVerificationCode?: string }>(
     response,
-    "Could not create demo workspace."
+    "Registration failed."
   );
-  return { ...body, userId: body.users[0]?.id };
 }
 
-export async function listDocuments(context: TenantContext) {
-  const response = await fetch(`${apiUrl}/api/documents`, { headers: headers(context) });
+export async function verifyEmail(payload: { email: string; code: string }) {
+  const response = await fetch(`${apiUrl}/api/auth/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ ok: true }>(response, "Verification failed.");
+}
+
+export async function resendCode(email: string) {
+  const response = await fetch(`${apiUrl}/api/auth/resend-code`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email })
+  });
+  return parseOrThrow<{ ok: true; devVerificationCode?: string }>(response, "Could not resend code.");
+}
+
+export async function login(payload: { email: string; password: string }) {
+  const response = await fetch(`${apiUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ token: string; user: SessionUser }>(response, "Sign-in failed.");
+}
+
+export async function me(token: string) {
+  const response = await fetch(`${apiUrl}/api/auth/me`, { headers: bearer(token) });
+  return parseOrThrow<{ user: SessionUser }>(response, "Session expired.");
+}
+
+export async function changePassword(
+  token: string,
+  payload: { currentPassword: string; newPassword: string }
+) {
+  const response = await fetch(`${apiUrl}/api/auth/change-password`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(token) },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ ok: true }>(response, "Could not change password.");
+}
+
+export async function setupDemo() {
+  const response = await fetch(`${apiUrl}/api/setup/demo`, { method: "POST" });
+  return parseOrThrow<{ companyId: string; password: string; users: CompanyUser[] }>(
+    response,
+    "Demo setup is not available."
+  );
+}
+
+// ---- Tenant features ----
+
+export async function listDocuments(token: string) {
+  const response = await fetch(`${apiUrl}/api/documents`, { headers: bearer(token) });
   return parseOrThrow<{ documents: CompanyDocument[] }>(response, "Could not load documents.");
 }
 
-export async function uploadDocument(context: TenantContext, formData: FormData) {
+export async function uploadDocument(token: string, formData: FormData) {
   const response = await fetch(`${apiUrl}/api/documents`, {
     method: "POST",
-    headers: headers(context),
+    headers: bearer(token),
     body: formData
   });
   return parseOrThrow<{ document: CompanyDocument }>(response, "Upload failed.");
 }
 
 export async function askQuestion(
-  context: TenantContext,
+  token: string,
   payload: { question: string; provider: "openai" | "huggingface" }
 ) {
   const response = await fetch(`${apiUrl}/api/ask`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers(context) },
+    headers: { "content-type": "application/json", ...bearer(token) },
     body: JSON.stringify(payload)
   });
   return parseOrThrow<{ answer: string; sources: Source[]; grounded: boolean; questionId: string }>(
@@ -155,14 +225,10 @@ export async function askQuestion(
   );
 }
 
-export async function downloadDocument(
-  context: TenantContext,
-  documentId: string,
-  filename: string
-) {
-  // Tenant auth travels in headers, so a plain <a href> download won't work.
+export async function downloadDocument(token: string, documentId: string, filename: string) {
+  // Auth travels in headers, so a plain <a href> download won't work.
   const response = await fetch(`${apiUrl}/api/documents/${documentId}/file`, {
-    headers: headers(context)
+    headers: bearer(token)
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
@@ -177,50 +243,68 @@ export async function downloadDocument(
   URL.revokeObjectURL(url);
 }
 
-// ---- Admin API ----
+// ---- Company admin ----
 
-function jsonHeaders(context: TenantContext) {
-  return { "content-type": "application/json", ...headers(context) };
+function jsonHeaders(token: string) {
+  return { "content-type": "application/json", ...bearer(token) };
 }
 
-export async function adminListUsers(context: TenantContext) {
-  const response = await fetch(`${apiUrl}/api/admin/users`, { headers: headers(context) });
-  return parseOrThrow<{ users: DemoUser[] }>(response, "Could not load users.");
+export async function adminListUsers(token: string) {
+  const response = await fetch(`${apiUrl}/api/admin/users`, { headers: bearer(token) });
+  return parseOrThrow<{ users: CompanyUser[] }>(response, "Could not load users.");
+}
+
+export async function adminCreateUser(
+  token: string,
+  payload: {
+    email: string;
+    name: string;
+    roles: Role[];
+    department: DepartmentName;
+    tempPassword?: string;
+  }
+) {
+  const response = await fetch(`${apiUrl}/api/admin/users`, {
+    method: "POST",
+    headers: jsonHeaders(token),
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ user: CompanyUser; tempPassword: string }>(response, "Could not create user.");
 }
 
 export async function adminUpdateUser(
-  context: TenantContext,
+  token: string,
   userId: string,
   payload: { roles?: Role[]; department?: DepartmentName }
 ) {
   const response = await fetch(`${apiUrl}/api/admin/users/${userId}`, {
     method: "PATCH",
-    headers: jsonHeaders(context),
+    headers: jsonHeaders(token),
     body: JSON.stringify(payload)
   });
-  return parseOrThrow<{ user: DemoUser }>(response, "Could not update user.");
+  return parseOrThrow<{ user: CompanyUser }>(response, "Could not update user.");
 }
 
-export async function adminListDocuments(context: TenantContext) {
-  const response = await fetch(`${apiUrl}/api/admin/documents`, { headers: headers(context) });
+export async function adminListDocuments(token: string) {
+  const response = await fetch(`${apiUrl}/api/admin/documents`, { headers: bearer(token) });
   return parseOrThrow<{ documents: AdminDocument[] }>(response, "Could not load documents.");
 }
 
 export async function adminUpdateDocumentAccess(
-  context: TenantContext,
+  token: string,
   documentId: string,
   payload: { allowedRoles: Role[]; allowedDepartments: DepartmentName[] }
 ) {
   const response = await fetch(`${apiUrl}/api/admin/documents/${documentId}/access`, {
     method: "PATCH",
-    headers: jsonHeaders(context),
+    headers: jsonHeaders(token),
     body: JSON.stringify(payload)
   });
   return parseOrThrow<{ ok: true }>(response, "Could not update document access.");
 }
 
 export async function adminBulkAccess(
-  context: TenantContext,
+  token: string,
   payload: {
     documentIds?: string[];
     category?: string;
@@ -230,22 +314,69 @@ export async function adminBulkAccess(
 ) {
   const response = await fetch(`${apiUrl}/api/admin/documents/bulk-access`, {
     method: "POST",
-    headers: jsonHeaders(context),
+    headers: jsonHeaders(token),
     body: JSON.stringify(payload)
   });
   return parseOrThrow<{ ok: true; updated: number }>(response, "Bulk update failed.");
 }
 
-export async function adminAccessMatrix(context: TenantContext) {
-  const response = await fetch(`${apiUrl}/api/admin/access-matrix`, { headers: headers(context) });
+export async function adminAccessMatrix(token: string) {
+  const response = await fetch(`${apiUrl}/api/admin/access-matrix`, { headers: bearer(token) });
   return parseOrThrow<AccessMatrix>(response, "Could not load access matrix.");
 }
 
-export async function adminAudit(context: TenantContext, cursor?: string) {
+export async function adminAudit(token: string, cursor?: string) {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-  const response = await fetch(`${apiUrl}/api/admin/audit${query}`, { headers: headers(context) });
+  const response = await fetch(`${apiUrl}/api/admin/audit${query}`, { headers: bearer(token) });
   return parseOrThrow<{ entries: AuditEntry[]; nextCursor: string | null }>(
     response,
     "Could not load audit log."
   );
+}
+
+// ---- Root admin (platform ops — separate token scope) ----
+
+export async function rootLogin(payload: { email: string; password: string }) {
+  const response = await fetch(`${apiUrl}/api/root/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ token: string; rootAdmin: { id: string; email: string } }>(
+    response,
+    "Root sign-in failed."
+  );
+}
+
+export async function rootListCompanies(token: string) {
+  const response = await fetch(`${apiUrl}/api/root/companies`, { headers: bearer(token) });
+  return parseOrThrow<{ companies: RootCompany[] }>(response, "Could not load companies.");
+}
+
+export async function rootListCompanyUsers(token: string, companyId: string) {
+  const response = await fetch(`${apiUrl}/api/root/companies/${companyId}/users`, {
+    headers: bearer(token)
+  });
+  return parseOrThrow<{ users: RootCompanyUser[] }>(response, "Could not load users.");
+}
+
+export async function rootSetCompanyStatus(
+  token: string,
+  companyId: string,
+  status: "ACTIVE" | "SUSPENDED"
+) {
+  const response = await fetch(`${apiUrl}/api/root/companies/${companyId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", ...bearer(token) },
+    body: JSON.stringify({ status })
+  });
+  return parseOrThrow<{ ok: true }>(response, "Could not update company.");
+}
+
+export async function rootVerifyUser(token: string, userId: string) {
+  const response = await fetch(`${apiUrl}/api/root/users/${userId}/verify`, {
+    method: "PATCH",
+    headers: bearer(token)
+  });
+  return parseOrThrow<{ ok: true }>(response, "Could not verify user.");
 }

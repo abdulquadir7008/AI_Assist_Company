@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { prisma } from "@company-rag/database";
 import {
   AuditAction,
@@ -9,6 +10,7 @@ import express from "express";
 import { z } from "zod";
 import { canAccess, effectiveChunkAcl, type Acl } from "../access/policy.js";
 import { audit } from "../audit/audit.js";
+import { hashPassword } from "../auth/passwords.js";
 import { updateChunkMetadata } from "../rag/chroma.js";
 import { buildChunkMetadata } from "../rag/metadata.js";
 import { asyncHandler } from "./asyncHandler.js";
@@ -61,9 +63,66 @@ adminRouter.get(
     const users = await prisma.user.findMany({
       where: { companyId: principal.companyId },
       orderBy: { createdAt: "asc" },
-      select: { id: true, email: true, name: true, roles: true, department: true }
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        roles: true,
+        department: true,
+        emailVerifiedAt: true,
+        mustChangePassword: true
+      }
     });
     response.json({ users });
+  })
+);
+
+adminRouter.post(
+  "/users",
+  asyncHandler(async (request, response) => {
+    const principal = getPrincipal(response);
+    const body = z
+      .object({
+        email: z.string().trim().toLowerCase().email(),
+        name: z.string().trim().min(1).max(80),
+        roles: z.array(z.nativeEnum(Role)).min(1),
+        department: z.nativeEnum(Department),
+        tempPassword: z.string().min(8).max(128).optional()
+      })
+      .parse(request.body);
+
+    const existing = await prisma.user.findUnique({ where: { email: body.email } });
+    if (existing) {
+      response.status(409).json({ error: "An account with this email already exists." });
+      return;
+    }
+
+    // Admin-created teammates skip email verification but must set their own
+    // password on first login.
+    const tempPassword = body.tempPassword ?? randomBytes(9).toString("base64url");
+    const user = await prisma.user.create({
+      data: {
+        email: body.email,
+        name: body.name,
+        roles: body.roles,
+        department: body.department,
+        companyId: principal.companyId,
+        passwordHash: await hashPassword(tempPassword),
+        emailVerifiedAt: new Date(),
+        mustChangePassword: true
+      },
+      select: { id: true, email: true, name: true, roles: true, department: true }
+    });
+
+    await audit(principal, AuditAction.USER_CREATE, {
+      targetUserId: user.id,
+      email: user.email,
+      roles: body.roles,
+      department: body.department
+    });
+
+    // The temp password is returned exactly once and never stored in plain.
+    response.status(201).json({ user, tempPassword });
   })
 );
 

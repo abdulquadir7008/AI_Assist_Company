@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import {
   AccessMatrix,
@@ -9,17 +10,19 @@ import {
   adminAccessMatrix,
   adminAudit,
   adminBulkAccess,
+  adminCreateUser,
   adminListDocuments,
   adminListUsers,
   adminUpdateDocumentAccess,
   adminUpdateUser,
+  ApiError,
   AuditEntry,
-  DemoUser,
+  CompanyUser,
   DepartmentName,
-  Role,
-  TenantContext
+  Role
 } from "../../lib/api";
-import { ArrowLeft, Check, Loader2, ShieldCheck, X } from "lucide-react";
+import { AuthSession, clearSession, getSession } from "../../lib/session";
+import { ArrowLeft, BadgeCheck, Check, Loader2, ShieldCheck, UserPlus, X } from "lucide-react";
 
 const allRoles: Role[] = ["ADMIN", "HR", "LEGAL", "MANAGER", "EMPLOYEE", "CONTRACTOR"];
 const allDepartments: DepartmentName[] = [
@@ -36,9 +39,10 @@ const tabs = ["Users", "Documents", "Access Matrix", "Audit"] as const;
 type Tab = (typeof tabs)[number];
 
 export default function AdminPage() {
-  const [context, setContext] = useState<TenantContext | null>(null);
+  const router = useRouter();
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [tab, setTab] = useState<Tab>("Users");
-  const [users, setUsers] = useState<DemoUser[]>([]);
+  const [users, setUsers] = useState<CompanyUser[]>([]);
   const [documents, setDocuments] = useState<AdminDocument[]>([]);
   const [matrix, setMatrix] = useState<AccessMatrix | null>(null);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
@@ -46,53 +50,57 @@ export default function AdminPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [tempPasswordNotice, setTempPasswordNotice] = useState<{
+    email: string;
+    tempPassword: string;
+  } | null>(null);
 
   useEffect(() => {
-    const cached = window.localStorage.getItem("company-rag-context-v2");
-    if (cached) {
-      setContext(JSON.parse(cached) as TenantContext);
-    } else {
-      setError("Open the main page first so the workspace can start.");
+    const cached = getSession();
+    if (!cached) {
+      router.replace("/login");
+      return;
     }
-  }, []);
+    setSession(cached);
+  }, [router]);
 
   const refresh = useCallback(
-    async (activeContext: TenantContext) => {
+    async (activeSession: AuthSession) => {
       setBusy(true);
       setError(null);
       try {
         const [usersResult, documentsResult, matrixResult, auditResult] = await Promise.all([
-          adminListUsers(activeContext),
-          adminListDocuments(activeContext),
-          adminAccessMatrix(activeContext),
-          adminAudit(activeContext)
+          adminListUsers(activeSession.token),
+          adminListDocuments(activeSession.token),
+          adminAccessMatrix(activeSession.token),
+          adminAudit(activeSession.token)
         ]);
         setUsers(usersResult.users);
         setDocuments(documentsResult.documents);
         setMatrix(matrixResult);
         setAuditEntries(auditResult.entries);
       } catch (caught) {
+        if (caught instanceof ApiError && caught.status === 401) {
+          clearSession();
+          router.replace("/login");
+          return;
+        }
         setError(caught instanceof Error ? caught.message : "Could not load admin data.");
       } finally {
         setBusy(false);
       }
     },
-    []
+    [router]
   );
 
   useEffect(() => {
-    if (context) {
-      void refresh(context);
+    if (session) {
+      void refresh(session);
     }
-  }, [context, refresh]);
-
-  const activeUser = useMemo(
-    () => context?.users.find((user) => user.id === context.userId),
-    [context]
-  );
+  }, [session, refresh]);
 
   async function run(action: () => Promise<unknown>, successNotice: string) {
-    if (!context) {
+    if (!session) {
       return;
     }
     setBusy(true);
@@ -101,7 +109,7 @@ export default function AdminPage() {
     try {
       await action();
       setNotice(successNotice);
-      await refresh(context);
+      await refresh(session);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Action failed.");
     } finally {
@@ -120,7 +128,7 @@ export default function AdminPage() {
             <div>
               <h1 className="text-xl font-semibold text-ink">Access Administration</h1>
               <p className="text-sm text-muted">
-                Signed in as {activeUser?.email ?? "…"} — roles resolved server-side per request
+                Signed in as {session?.user.email ?? "…"} — roles resolved server-side per request
               </p>
             </div>
           </div>
@@ -162,73 +170,120 @@ export default function AdminPage() {
             {notice}
           </div>
         ) : null}
+        {tempPasswordNotice ? (
+          <div className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            <p className="font-semibold">
+              Temporary password for {tempPasswordNotice.email} — share it securely, it will not be
+              shown again:
+            </p>
+            <p className="mt-1 select-all font-mono text-base">{tempPasswordNotice.tempPassword}</p>
+            <button
+              type="button"
+              onClick={() => setTempPasswordNotice(null)}
+              className="mt-1 text-xs font-medium underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : null}
 
-        {tab === "Users" && context ? (
-          <section className="rounded border border-line bg-white p-4 shadow-panel">
-            <h2 className="mb-3 text-base font-semibold text-ink">Users, roles and departments</h2>
-            <div className="space-y-3">
-              {users.map((user) => (
-                <article key={user.id} className="rounded border border-line p-3">
-                  <div className="mb-2 flex items-center justify-between">
-                    <p className="text-sm font-semibold text-ink">
-                      {user.name ?? user.email}
-                      <span className="ml-2 text-xs font-normal text-muted">{user.email}</span>
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                    <div className="flex flex-wrap gap-x-3 gap-y-1">
-                      {allRoles.map((role) => (
-                        <label key={role} className="flex items-center gap-1 text-xs text-ink">
-                          <input
-                            type="checkbox"
-                            checked={user.roles.includes(role)}
-                            disabled={busy}
-                            onChange={(event) => {
-                              const nextRoles = event.target.checked
-                                ? [...user.roles, role]
-                                : user.roles.filter((item) => item !== role);
-                              if (nextRoles.length === 0) {
-                                setError("A user needs at least one role.");
-                                return;
-                              }
-                              void run(
-                                () => adminUpdateUser(context, user.id, { roles: nextRoles }),
-                                `Updated roles for ${user.email}.`
-                              );
-                            }}
-                          />
-                          {role}
-                        </label>
-                      ))}
+        {tab === "Users" && session ? (
+          <section className="space-y-3">
+            <AddUserForm
+              busy={busy}
+              onCreate={(payload) =>
+                void run(async () => {
+                  const result = await adminCreateUser(session.token, payload);
+                  setTempPasswordNotice({
+                    email: result.user.email,
+                    tempPassword: result.tempPassword
+                  });
+                }, `Created account for ${payload.email}.`)
+              }
+            />
+            <div className="rounded border border-line bg-white p-4 shadow-panel">
+              <h2 className="mb-3 text-base font-semibold text-ink">Users, roles and departments</h2>
+              <div className="space-y-3">
+                {users.map((user) => (
+                  <article key={user.id} className="rounded border border-line p-3">
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-sm font-semibold text-ink">
+                        {user.name ?? user.email}
+                        <span className="ml-2 text-xs font-normal text-muted">{user.email}</span>
+                      </p>
+                      <div className="flex items-center gap-2 text-xs">
+                        {user.emailVerifiedAt ? (
+                          <span className="flex items-center gap-1 text-emerald-700">
+                            <BadgeCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                            verified
+                          </span>
+                        ) : (
+                          <span className="rounded bg-amber-50 px-1.5 py-0.5 font-medium text-amber-700">
+                            unverified
+                          </span>
+                        )}
+                        {user.mustChangePassword ? (
+                          <span className="rounded bg-paper px-1.5 py-0.5 text-muted">
+                            temp password
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
-                    <select
-                      value={user.department}
-                      disabled={busy}
-                      onChange={(event) =>
-                        void run(
-                          () =>
-                            adminUpdateUser(context, user.id, {
-                              department: event.target.value as DepartmentName
-                            }),
-                          `Updated department for ${user.email}.`
-                        )
-                      }
-                      className="rounded border border-line px-2 py-1 text-xs outline-none focus:border-accent"
-                    >
-                      {allDepartments.map((department) => (
-                        <option key={department} value={department}>
-                          {department}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </article>
-              ))}
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                      <div className="flex flex-wrap gap-x-3 gap-y-1">
+                        {allRoles.map((role) => (
+                          <label key={role} className="flex items-center gap-1 text-xs text-ink">
+                            <input
+                              type="checkbox"
+                              checked={user.roles.includes(role)}
+                              disabled={busy}
+                              onChange={(event) => {
+                                const nextRoles = event.target.checked
+                                  ? [...user.roles, role]
+                                  : user.roles.filter((item) => item !== role);
+                                if (nextRoles.length === 0) {
+                                  setError("A user needs at least one role.");
+                                  return;
+                                }
+                                void run(
+                                  () => adminUpdateUser(session.token, user.id, { roles: nextRoles }),
+                                  `Updated roles for ${user.email}.`
+                                );
+                              }}
+                            />
+                            {role}
+                          </label>
+                        ))}
+                      </div>
+                      <select
+                        value={user.department}
+                        disabled={busy}
+                        onChange={(event) =>
+                          void run(
+                            () =>
+                              adminUpdateUser(session.token, user.id, {
+                                department: event.target.value as DepartmentName
+                              }),
+                            `Updated department for ${user.email}.`
+                          )
+                        }
+                        className="rounded border border-line px-2 py-1 text-xs outline-none focus:border-accent"
+                      >
+                        {allDepartments.map((department) => (
+                          <option key={department} value={department}>
+                            {department}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </article>
+                ))}
+              </div>
             </div>
           </section>
         ) : null}
 
-        {tab === "Documents" && context ? (
+        {tab === "Documents" && session ? (
           <section className="space-y-3">
             {selectedDocs.size > 0 ? (
               <BulkBar
@@ -237,7 +292,7 @@ export default function AdminPage() {
                 onApply={(roles, departments) =>
                   void run(
                     () =>
-                      adminBulkAccess(context, {
+                      adminBulkAccess(session.token, {
                         documentIds: [...selectedDocs],
                         allowedRoles: roles,
                         allowedDepartments: departments
@@ -267,7 +322,7 @@ export default function AdminPage() {
                 onSave={(roles, departments) =>
                   void run(
                     () =>
-                      adminUpdateDocumentAccess(context, document.id, {
+                      adminUpdateDocumentAccess(session.token, document.id, {
                         allowedRoles: roles,
                         allowedDepartments: departments
                       }),
@@ -336,7 +391,7 @@ export default function AdminPage() {
           </section>
         ) : null}
 
-        {tab === "Audit" && context ? (
+        {tab === "Audit" && session ? (
           <section className="rounded border border-line bg-white p-4 shadow-panel">
             <h2 className="mb-3 text-base font-semibold text-ink">Audit log</h2>
             <div className="space-y-2">
@@ -347,9 +402,11 @@ export default function AdminPage() {
                       {entry.action}
                     </span>
                     <span className="text-muted">
-                      {users.find((user) => user.id === entry.userId)?.email ?? entry.userId}
+                      {entry.userId
+                        ? (users.find((user) => user.id === entry.userId)?.email ?? entry.userId)
+                        : "system / root"}
                     </span>
-                    <span className="text-muted">[{entry.rolesSnapshot.join(", ")}]</span>
+                    <span className="text-muted">[{entry.rolesSnapshot.join(", ") || "—"}]</span>
                     <span className="text-muted">{new Date(entry.createdAt).toLocaleString()}</span>
                   </div>
                   <pre className="overflow-x-auto whitespace-pre-wrap break-all text-muted">
@@ -365,6 +422,116 @@ export default function AdminPage() {
         ) : null}
       </div>
     </main>
+  );
+}
+
+function AddUserForm({
+  busy,
+  onCreate
+}: {
+  busy: boolean;
+  onCreate: (payload: {
+    email: string;
+    name: string;
+    roles: Role[];
+    department: DepartmentName;
+    tempPassword?: string;
+  }) => void;
+}) {
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [roles, setRoles] = useState<Role[]>(["EMPLOYEE"]);
+  const [department, setDepartment] = useState<DepartmentName>("GENERAL");
+  const [tempPassword, setTempPassword] = useState("");
+
+  function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (roles.length === 0) {
+      return;
+    }
+    onCreate({
+      email,
+      name,
+      roles,
+      department,
+      ...(tempPassword ? { tempPassword } : {})
+    });
+    setEmail("");
+    setName("");
+    setRoles(["EMPLOYEE"]);
+    setDepartment("GENERAL");
+    setTempPassword("");
+  }
+
+  return (
+    <form onSubmit={onSubmit} className="rounded border border-line bg-white p-4 shadow-panel">
+      <h2 className="mb-3 flex items-center gap-2 text-base font-semibold text-ink">
+        <UserPlus className="h-4 w-4 text-accent" aria-hidden="true" />
+        Add a teammate
+      </h2>
+      <div className="grid gap-3 md:grid-cols-2">
+        <input
+          type="email"
+          required
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          placeholder="teammate@company.com"
+          className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+        />
+        <input
+          required
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          placeholder="Full name"
+          className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+        />
+        <select
+          value={department}
+          onChange={(event) => setDepartment(event.target.value as DepartmentName)}
+          className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+        >
+          {allDepartments.map((item) => (
+            <option key={item} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+        <input
+          type="text"
+          value={tempPassword}
+          onChange={(event) => setTempPassword(event.target.value)}
+          placeholder="Temp password (optional — generated if empty)"
+          minLength={tempPassword ? 8 : undefined}
+          className="rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+        />
+      </div>
+      <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1">
+        {allRoles.map((role) => (
+          <label key={role} className="flex items-center gap-1 text-xs text-ink">
+            <input
+              type="checkbox"
+              checked={roles.includes(role)}
+              onChange={(event) =>
+                setRoles((current) =>
+                  event.target.checked ? [...current, role] : current.filter((item) => item !== role)
+                )
+              }
+            />
+            {role}
+          </label>
+        ))}
+      </div>
+      <p className="mt-2 text-xs text-muted">
+        The account is pre-verified and must change its password on first sign-in.
+      </p>
+      <button
+        type="submit"
+        disabled={busy || roles.length === 0}
+        className="mt-3 rounded bg-accent px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+      >
+        Create account
+      </button>
+    </form>
   );
 }
 

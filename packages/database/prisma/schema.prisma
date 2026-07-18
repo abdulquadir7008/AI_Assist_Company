@@ -65,33 +65,71 @@ enum AuditAction {
   ROLE_CHANGE
   RECLASSIFY
   CHUNK_RECLASSIFY
+  REGISTER
+  VERIFY_EMAIL
+  LOGIN
+  USER_CREATE
+  PASSWORD_CHANGE
+  COMPANY_STATUS_CHANGE
+}
+
+enum CompanyStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
 }
 
 model Company {
-  id        String     @id @default(cuid())
+  id        String        @id @default(cuid())
   name      String
-  slug      String     @unique
+  slug      String        @unique
+  status    CompanyStatus @default(PENDING_VERIFICATION)
   users     User[]
   documents Document[]
   questions Question[]
   auditLogs AuditLog[]
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
 }
 
 model User {
-  id         String     @id @default(cuid())
-  email      String
-  name       String?
-  roles      Role[]     @default([EMPLOYEE])
-  department Department @default(GENERAL)
-  companyId  String
-  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  questions  Question[]
-  createdAt  DateTime   @default(now())
-  updatedAt  DateTime   @updatedAt
+  id                 String             @id @default(cuid())
+  email              String             @unique
+  name               String?
+  passwordHash       String?
+  emailVerifiedAt    DateTime?
+  mustChangePassword Boolean            @default(false)
+  roles              Role[]             @default([EMPLOYEE])
+  department         Department         @default(GENERAL)
+  companyId          String
+  company            Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  questions          Question[]
+  verificationCodes  VerificationCode[]
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
 
   @@unique([companyId, email])
+}
+
+model VerificationCode {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash   String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model RootAdmin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model Document {

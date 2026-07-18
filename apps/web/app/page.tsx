@@ -5,22 +5,22 @@ import {
   ApiError,
   askQuestion,
   CompanyDocument,
-  DemoUser,
   DepartmentName,
   downloadDocument,
   listDocuments,
+  me,
   Role,
-  setupDemo,
   Source,
-  TenantContext,
   uploadDocument
 } from "../lib/api";
+import { AuthSession, clearSession, getSession, setSession } from "../lib/session";
 import { AnswerWithSources } from "../components/AnswerWithSources";
 import {
   Bot,
   Building2,
   FileText,
   Loader2,
+  LogOut,
   MessageSquareText,
   RefreshCw,
   Search,
@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -60,10 +61,9 @@ const allDepartments: DepartmentName[] = [
   "LEADERSHIP"
 ];
 
-const contextStorageKey = "company-rag-context-v2";
-
 export default function Home() {
-  const [context, setContext] = useState<TenantContext | null>(null);
+  const router = useRouter();
+  const [session, setSessionState] = useState<AuthSession | null>(null);
   const [documents, setDocuments] = useState<CompanyDocument[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -88,64 +88,80 @@ export default function Home() {
     [documents]
   );
 
-  async function refreshDocuments(activeContext = context) {
-    if (!activeContext) {
+  function signOut() {
+    clearSession();
+    router.replace("/login");
+  }
+
+  function handleAuthFailure(caught: unknown, fallback: string) {
+    if (caught instanceof ApiError && caught.status === 401) {
+      signOut();
+      return;
+    }
+    setError(caught instanceof Error ? caught.message : fallback);
+  }
+
+  async function refreshDocuments(activeSession = session) {
+    if (!activeSession) {
       return;
     }
 
     setLoadingDocuments(true);
     try {
-      const result = await listDocuments(activeContext);
+      const result = await listDocuments(activeSession.token);
       setDocuments(result.documents);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not load documents.");
+      handleAuthFailure(caught, "Could not load documents.");
     } finally {
       setLoadingDocuments(false);
     }
   }
 
   useEffect(() => {
-    const cached = window.localStorage.getItem(contextStorageKey);
+    const cached = getSession();
+    if (!cached) {
+      router.replace("/login");
+      return;
+    }
+    if (cached.user.mustChangePassword) {
+      router.replace("/change-password");
+      return;
+    }
 
-    async function boot() {
+    async function boot(active: AuthSession) {
       try {
-        let activeContext = cached ? (JSON.parse(cached) as TenantContext) : await setupDemo();
-        if (!activeContext.users?.length) {
-          activeContext = await setupDemo();
+        // Refresh roles/department from the server — the token only carries
+        // identity, so permission changes appear on the next page load.
+        const current = await me(active.token);
+        const refreshed = { token: active.token, user: current.user };
+        setSession(refreshed);
+        setSessionState(refreshed);
+        if (current.user.mustChangePassword) {
+          router.replace("/change-password");
+          return;
         }
-        window.localStorage.setItem(contextStorageKey, JSON.stringify(activeContext));
-        setContext(activeContext);
-        await refreshDocuments(activeContext);
+        await refreshDocuments(refreshed);
       } catch (caught) {
+        if (caught instanceof ApiError && (caught.status === 401 || caught.status === 403)) {
+          clearSession();
+          router.replace("/login");
+          return;
+        }
         setError(caught instanceof Error ? caught.message : "Could not start workspace.");
       }
     }
 
-    void boot();
-  }, []);
+    void boot(cached);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router]);
 
-  const activeUser = useMemo(
-    () => context?.users.find((user) => user.id === context.userId),
-    [context]
-  );
+  const activeUser = session?.user ?? null;
   const isAdmin = activeUser?.roles.includes("ADMIN") ?? false;
-
-  async function switchPersona(userId: string) {
-    if (!context) {
-      return;
-    }
-    const nextContext = { ...context, userId };
-    window.localStorage.setItem(contextStorageKey, JSON.stringify(nextContext));
-    setContext(nextContext);
-    setError(null);
-    // Permissions changed: refetch what this persona is allowed to see.
-    await refreshDocuments(nextContext);
-  }
 
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const file = fileRef.current?.files?.[0];
-    if (!context || !file) {
+    if (!session || !file) {
       setError("Choose a document first.");
       return;
     }
@@ -164,16 +180,16 @@ export default function Home() {
     }
 
     try {
-      await uploadDocument(context, formData);
+      await uploadDocument(session.token, formData);
       setTitle("");
       setUploadRoles([]);
       setUploadDepartments([]);
       if (fileRef.current) {
         fileRef.current.value = "";
       }
-      await refreshDocuments(context);
+      await refreshDocuments(session);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Upload failed.");
+      handleAuthFailure(caught, "Upload failed.");
     } finally {
       setUploading(false);
     }
@@ -182,7 +198,7 @@ export default function Home() {
   async function onAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmed = question.trim();
-    if (!context || !trimmed) {
+    if (!session || !trimmed) {
       return;
     }
 
@@ -192,7 +208,7 @@ export default function Home() {
     setError(null);
 
     try {
-      const result = await askQuestion(context, { question: trimmed, provider });
+      const result = await askQuestion(session.token, { question: trimmed, provider });
       setMessages((current) => [
         ...current,
         {
@@ -203,24 +219,24 @@ export default function Home() {
         }
       ]);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Question failed.");
+      handleAuthFailure(caught, "Question failed.");
     } finally {
       setAnswering(false);
     }
   }
 
   async function onDownload(documentId: string, filename: string) {
-    if (!context) {
+    if (!session) {
       return;
     }
     try {
-      await downloadDocument(context, documentId, filename);
+      await downloadDocument(session.token, documentId, filename);
     } catch (caught) {
       if (caught instanceof ApiError && (caught.status === 403 || caught.status === 404)) {
         setError("This document is not available to your current role.");
         return;
       }
-      setError(caught instanceof Error ? caught.message : "Download failed.");
+      handleAuthFailure(caught, "Download failed.");
     }
   }
 
@@ -241,24 +257,24 @@ export default function Home() {
           </div>
           <div className="flex flex-col gap-2 md:items-end">
             <div className="grid grid-cols-3 gap-2 text-sm">
-              <Metric icon={Building2} label="Workspace" value={context ? "Ready" : "Starting"} />
+              <Metric icon={Building2} label="Workspace" value={session ? "Ready" : "Starting"} />
               <Metric icon={FileText} label="Docs" value={String(documents.length)} />
               <Metric icon={Search} label="Indexed" value={String(readyCount)} />
             </div>
             <div className="flex items-center gap-2">
-              <UserRound className="h-4 w-4 text-muted" aria-hidden="true" />
-              <select
-                value={context?.userId ?? ""}
-                onChange={(event) => void switchPersona(event.target.value)}
-                className="rounded border border-line px-2 py-1.5 text-sm outline-none focus:border-accent"
-                title="Switch demo persona"
-              >
-                {(context?.users ?? []).map((user) => (
-                  <option key={user.id} value={user.id}>
-                    {user.email} · {user.roles.join("+")} · {user.department}
-                  </option>
-                ))}
-              </select>
+              <span className="flex items-center gap-1.5 rounded border border-line px-2 py-1.5 text-sm text-ink">
+                <UserRound className="h-4 w-4 text-muted" aria-hidden="true" />
+                {activeUser ? (
+                  <>
+                    {activeUser.email}
+                    <span className="text-xs text-muted">
+                      {activeUser.roles.join("+")} · {activeUser.department}
+                    </span>
+                  </>
+                ) : (
+                  "…"
+                )}
+              </span>
               {isAdmin ? (
                 <Link
                   href="/admin"
@@ -268,6 +284,15 @@ export default function Home() {
                   Admin
                 </Link>
               ) : null}
+              <button
+                type="button"
+                onClick={signOut}
+                className="flex items-center gap-1.5 rounded border border-line px-2 py-1.5 text-sm text-muted hover:border-accent hover:text-accent"
+                title="Sign out"
+              >
+                <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                Sign out
+              </button>
             </div>
           </div>
         </div>
@@ -293,7 +318,7 @@ export default function Home() {
 
             {!isAdmin ? (
               <p className="rounded border border-dashed border-line p-3 text-xs text-muted">
-                Only admins can upload documents. Switch to the admin persona to add content.
+                Only admins can upload documents. Ask a workspace admin to add content.
               </p>
             ) : (
             <form className="space-y-3" onSubmit={onUpload}>
@@ -373,7 +398,7 @@ export default function Home() {
               </fieldset>
               <button
                 type="submit"
-                disabled={uploading || !context}
+                disabled={uploading || !session}
                 className="flex h-10 w-full items-center justify-center gap-2 rounded bg-accent px-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {uploading ? (
@@ -518,7 +543,7 @@ export default function Home() {
               />
               <button
                 type="submit"
-                disabled={answering || !question.trim() || !context}
+                disabled={answering || !question.trim() || !session}
                 className="grid h-12 w-12 shrink-0 place-items-center rounded bg-accent text-white disabled:cursor-not-allowed disabled:opacity-60"
                 title="Send question"
               >

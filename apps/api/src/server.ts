@@ -4,6 +4,9 @@ import helmet from "helmet";
 import { config } from "./config.js";
 import { authenticate, HttpError } from "./http/auth.js";
 import { adminRouter } from "./http/admin.js";
+import { authLimiter, authRouter } from "./http/authRoutes.js";
+import { rootRouter } from "./http/root.js";
+import { seedRootAdmin } from "./http/rootSeed.js";
 import { router } from "./http/routes.js";
 
 const app = express();
@@ -12,8 +15,14 @@ app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
 
-// Every /api route is authenticated except the health probe and the demo
-// bootstrap endpoint (which mints the demo personas).
+// Self-authenticating surfaces mounted before the tenant auth gate:
+// /api/auth handles registration/verification/login (rate-limited),
+// /api/root guards itself with root-scoped tokens.
+app.use("/api/auth", authLimiter, authRouter);
+app.use("/api/root", rootRouter);
+
+// Every remaining /api route requires a tenant session except the health
+// probe and the demo bootstrap endpoint (which 404s unless demo mode is on).
 const publicPaths = new Set(["/health", "/setup/demo"]);
 app.use("/api", (request, response, next) => {
   if (publicPaths.has(request.path)) {
@@ -42,6 +51,11 @@ app.use(
   }
 );
 
-app.listen(config.apiPort, () => {
-  console.log(`RAG API listening on http://localhost:${config.apiPort}`);
-});
+async function start() {
+  await seedRootAdmin();
+  app.listen(config.apiPort, () => {
+    console.log(`RAG API listening on http://localhost:${config.apiPort}`);
+  });
+}
+
+void start();

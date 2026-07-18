@@ -5,6 +5,7 @@ import { prisma } from "@company-rag/database";
 import {
   AiProvider,
   AuditAction,
+  CompanyStatus,
   Department,
   DocumentChunk,
   DocumentCategory,
@@ -18,6 +19,7 @@ import { z } from "zod";
 import { buildChromaAccessFilter, canAccess } from "../access/policy.js";
 import { getAiClient } from "../ai/providers.js";
 import { audit } from "../audit/audit.js";
+import { hashPassword } from "../auth/passwords.js";
 import { config } from "../config.js";
 import { chunkBlocks, roughTokenCount } from "../rag/chunk.js";
 import { upsertChunks, queryChunks } from "../rag/chroma.js";
@@ -90,25 +92,46 @@ const demoUsers: { email: string; name: string; roles: Role[]; department: Depar
 router.post(
   "/setup/demo",
   asyncHandler(async (_request, response) => {
+    // Demo bootstrap is for local/dev use only; disabled unless configured.
+    if (!config.enableDemoSetup) {
+      throw new HttpError(404, "Not found.");
+    }
+
     const company = await prisma.company.upsert({
       where: { slug: "demo-company" },
-      update: {},
-      create: { name: "Demo Company", slug: "demo-company" }
+      update: { status: CompanyStatus.ACTIVE },
+      create: { name: "Demo Company", slug: "demo-company", status: CompanyStatus.ACTIVE }
     });
+
+    // All personas share one hashed demo password and are pre-verified so the
+    // login flow works out of the box (also heals pre-auth demo users).
+    const demoPasswordHash = await hashPassword("demo-password");
 
     const users = [];
     for (const demoUser of demoUsers) {
       users.push(
         await prisma.user.upsert({
           where: { companyId_email: { companyId: company.id, email: demoUser.email } },
-          update: { roles: demoUser.roles, department: demoUser.department, name: demoUser.name },
-          create: { ...demoUser, companyId: company.id }
+          update: {
+            roles: demoUser.roles,
+            department: demoUser.department,
+            name: demoUser.name,
+            passwordHash: demoPasswordHash,
+            emailVerifiedAt: new Date()
+          },
+          create: {
+            ...demoUser,
+            companyId: company.id,
+            passwordHash: demoPasswordHash,
+            emailVerifiedAt: new Date()
+          }
         })
       );
     }
 
     response.json({
       companyId: company.id,
+      password: "demo-password",
       users: users.map((user) => ({
         id: user.id,
         email: user.email,

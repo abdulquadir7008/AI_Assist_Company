@@ -1,6 +1,8 @@
-import { prisma, Role } from "@company-rag/database";
+import { CompanyStatus, prisma, Role } from "@company-rag/database";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import type { Principal } from "../access/policy.js";
+import { verifyToken } from "../auth/tokens.js";
+import { config } from "../config.js";
 
 export class HttpError extends Error {
   constructor(
@@ -12,32 +14,43 @@ export class HttpError extends Error {
 }
 
 /**
- * Identity slice: the user id arrives in headers (no login yet), but the user
- * record — and therefore roles and department — is resolved from Postgres on
- * EVERY request. Roles are never trusted from the client, and role changes
- * (promotion, termination) take effect on the next request with no cache.
- * Swapping to JWT/SSO later only changes how userId is derived here.
+ * Identity comes from a Bearer JWT (typ "user" — root tokens are rejected),
+ * but the user record — and therefore roles, department, and the company's
+ * suspension state — is resolved from Postgres on EVERY request. Role
+ * changes, suspension, and account deletion all take effect on the next
+ * request with no cache.
  */
 export const authenticate: RequestHandler = (request, response, next) => {
   void (async () => {
-    const companyId = request.header("x-company-id");
-    const userId = request.header("x-user-id");
+    const header = request.header("authorization");
+    const token = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
 
-    if (!companyId || !userId) {
+    if (!token) {
       throw new HttpError(401, "Authentication required.");
     }
 
-    const user = await prisma.user.findFirst({
-      where: { id: userId, companyId }
+    let sub: string;
+    try {
+      ({ sub } = verifyToken(token, "user", config.auth.jwtSecret));
+    } catch {
+      throw new HttpError(401, "Invalid or expired session.");
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: sub },
+      include: { company: true }
     });
 
     if (!user) {
       throw new HttpError(401, "Unknown user.");
     }
+    if (user.company.status !== CompanyStatus.ACTIVE) {
+      throw new HttpError(403, "This workspace is currently unavailable.");
+    }
 
     const principal: Principal = {
       userId: user.id,
-      companyId,
+      companyId: user.companyId,
       roles: user.roles,
       department: user.department
     };
