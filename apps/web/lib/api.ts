@@ -48,6 +48,8 @@ export type AdminDocument = {
   unclassified: boolean;
   classifiedAt: string | null;
   legacyVisibilityHint: string;
+  source: "ADMIN" | "CHAT";
+  ownerEmail: string | null;
   chunkCount: number;
   overriddenChunks: {
     id: string;
@@ -96,6 +98,37 @@ export type RootCompanyUser = {
   email: string;
   name: string | null;
   emailVerifiedAt: string | null;
+  createdAt: string;
+};
+
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  messageCount: number;
+  updatedAt: string;
+};
+
+export type ConversationMessage = {
+  questionId: string;
+  question: string;
+  answer: string;
+  sources: Source[];
+  grounded: boolean;
+  createdAt: string;
+};
+
+export type Suggestion = {
+  question: string;
+  source: "popular" | "starter";
+};
+
+export type DigestRun = {
+  id: string;
+  periodStart: string;
+  periodEnd: string;
+  documentCount: number;
+  emailsSent: number;
+  slackSent: boolean;
   createdAt: string;
 };
 
@@ -212,17 +245,84 @@ export async function uploadDocument(token: string, formData: FormData) {
 
 export async function askQuestion(
   token: string,
-  payload: { question: string; provider: "openai" | "huggingface" }
+  payload: { question: string; provider: "openai" | "huggingface"; conversationId?: string },
+  openAiKey?: string | null
 ) {
   const response = await fetch(`${apiUrl}/api/ask`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...bearer(token),
+      // The user's own OpenAI key travels per request; the server never stores it.
+      ...(payload.provider === "openai" && openAiKey ? { "x-openai-key": openAiKey } : {})
+    },
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{
+    answer: string;
+    sources: Source[];
+    grounded: boolean;
+    questionId: string;
+    conversationId: string;
+    conversationTitle: string;
+  }>(response, "Question failed.");
+}
+
+export async function validateAiKey(
+  token: string,
+  payload: { provider: "openai" | "huggingface"; apiKey: string }
+) {
+  const response = await fetch(`${apiUrl}/api/ai/validate-key`, {
     method: "POST",
     headers: { "content-type": "application/json", ...bearer(token) },
     body: JSON.stringify(payload)
   });
-  return parseOrThrow<{ answer: string; sources: Source[]; grounded: boolean; questionId: string }>(
+  return parseOrThrow<{ ok: true; provider: string }>(response, "Key validation failed.");
+}
+
+// ---- Conversations ----
+
+export async function listConversations(token: string) {
+  const response = await fetch(`${apiUrl}/api/conversations`, { headers: bearer(token) });
+  return parseOrThrow<{ conversations: ConversationSummary[] }>(
     response,
-    "Question failed."
+    "Could not load conversations."
   );
+}
+
+export async function getConversation(token: string, conversationId: string) {
+  const response = await fetch(`${apiUrl}/api/conversations/${conversationId}`, {
+    headers: bearer(token)
+  });
+  return parseOrThrow<{
+    conversation: { id: string; title: string; updatedAt: string; messages: ConversationMessage[] };
+  }>(response, "Could not load conversation.");
+}
+
+export async function deleteConversation(token: string, conversationId: string) {
+  const response = await fetch(`${apiUrl}/api/conversations/${conversationId}`, {
+    method: "DELETE",
+    headers: bearer(token)
+  });
+  return parseOrThrow<{ ok: true }>(response, "Could not delete conversation.");
+}
+
+// ---- Chat upload + suggestions ----
+
+export async function chatUploadDocument(token: string, file: File) {
+  const formData = new FormData();
+  formData.set("file", file);
+  const response = await fetch(`${apiUrl}/api/documents/chat`, {
+    method: "POST",
+    headers: bearer(token),
+    body: formData
+  });
+  return parseOrThrow<{ document: CompanyDocument }>(response, "Upload failed.");
+}
+
+export async function getSuggestions(token: string) {
+  const response = await fetch(`${apiUrl}/api/suggestions`, { headers: bearer(token) });
+  return parseOrThrow<{ suggestions: Suggestion[] }>(response, "Could not load suggestions.");
 }
 
 export async function downloadDocument(token: string, documentId: string, filename: string) {
@@ -323,6 +423,43 @@ export async function adminBulkAccess(
 export async function adminAccessMatrix(token: string) {
   const response = await fetch(`${apiUrl}/api/admin/access-matrix`, { headers: bearer(token) });
   return parseOrThrow<AccessMatrix>(response, "Could not load access matrix.");
+}
+
+export async function adminGetDigest(token: string) {
+  const response = await fetch(`${apiUrl}/api/admin/digest`, { headers: bearer(token) });
+  return parseOrThrow<{ digestsEnabled: boolean; slackConfigured: boolean; runs: DigestRun[] }>(
+    response,
+    "Could not load digest settings."
+  );
+}
+
+export async function adminUpdateDigest(
+  token: string,
+  payload: { digestsEnabled?: boolean; slackWebhookUrl?: string }
+) {
+  const response = await fetch(`${apiUrl}/api/admin/digest`, {
+    method: "PATCH",
+    headers: jsonHeaders(token),
+    body: JSON.stringify(payload)
+  });
+  return parseOrThrow<{ ok: true; digestsEnabled: boolean; slackConfigured: boolean }>(
+    response,
+    "Could not update digest settings."
+  );
+}
+
+export async function adminSendDigestNow(token: string) {
+  const response = await fetch(`${apiUrl}/api/admin/digest/send-now`, {
+    method: "POST",
+    headers: bearer(token)
+  });
+  return parseOrThrow<{
+    ok: true;
+    documentCount: number;
+    emailsSent: number;
+    emailsSkipped: number;
+    slackSent: boolean;
+  }>(response, "Could not send digest.");
 }
 
 export async function adminAudit(token: string, cursor?: string) {

@@ -24,6 +24,15 @@ Access control is enforced **at the retrieval layer**, not the UI. Every chunk c
 - **Chunk-level overrides** for mixed-sensitivity documents (e.g., a handbook with a confidential appendix) via the admin API.
 - **Admin controls** at `/admin`: user role/department management, document (bulk) reclassification — which rewrites vector-store metadata without re-embedding — an access matrix computed from the same predicate retrieval enforces, and a full audit log (every query records the requester's roles and exactly which chunks were retrieved and cited).
 
+## Assistant Features
+
+More than a search bar — the chat behaves like a real assistant:
+
+- **Multi-turn conversations.** Chats are saved per user and follow-ups keep their context: "what about for remote employees?" is rewritten by a condense step into a standalone retrieval query using the conversation history, then answered with the history in the prompt. Conversations are strictly private to their owner — even admins cannot read another user's chat.
+- **Document upload via chat.** Drag a file into the chat (or use the paperclip) and ask about it immediately. Chat uploads are **private to the uploader**: a dedicated owner lane in the ACL (enforced inside the vector-search filter, like all access rules) means only the uploader and admins can retrieve or even see the document until an admin reclassifies it from the admin page.
+- **Proactive digests.** Every Monday morning (plus an admin "Send now" button) users get a "N policies changed this week" email listing new/reclassified documents — filtered per recipient with the same access predicate, so nobody is told about a document they can't read; users with no relevant changes get no email. An optional per-company Slack webhook posts a company-wide summary that only ever includes broadly-visible documents.
+- **Suggested questions.** Empty chats show clickable suggestions: the most popular grounded questions asked in your department in the last 30 days — shown only if every document those answers cited is accessible to *you* (restricted topics never leak through popularity) — topped up with curated per-department starters.
+
 ## Source Citations
 
 Every answer is traceable back to its source. Documents are chunked with metadata (document name, section/heading, page number, upload date) stored alongside each vector. Answers cite sources with inline `[1]`-style markers, and the API returns a structured `sources` array mapping each marker to its document, section, and page. The chat UI renders clickable citation chips, a per-answer Sources panel grouped by document with download links, and a `⚠` staleness flag for documents not updated in over 12 months. If the retrieved context can't support an answer, the assistant says so instead of guessing (`grounded: false`, no fabricated citations).
@@ -90,7 +99,7 @@ The web app runs on `http://localhost:3000` and the API runs on `http://localhos
 - Extract document text, split it into searchable chunks, embed chunks, and store vectors in Chroma.
 - Ask questions and receive answers grounded in retrieved internal context.
 - Trace every answer to its sources: inline `[n]` citations, section/page metadata, document download, and stale-document warnings.
-- Switch AI provider per question with `openai` or `huggingface`.
+- Ask with the default Hugging Face model, or switch to OpenAI by entering your own API key (validated with a test call, kept in your browser only, sent per request, never stored server-side; a rejected key re-prompts and re-runs your question). Retrieval always embeds with the server's indexing provider so vector search stays consistent regardless of the answering model.
 
 ## Production Notes
 

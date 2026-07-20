@@ -38,13 +38,23 @@ Rules:
 
 export function buildAskPrompt(
   question: string,
-  chunks: RetrievedChunk[]
+  chunks: RetrievedChunk[],
+  history: { question: string; answer: string }[] = []
 ): { system: string; user: string } {
   const sources = chunks
     .map((chunk, index) => `[${index + 1}] ${sourceLabel(chunk, index + 1)}\n${chunk.content}`)
     .join("\n\n");
 
-  const user = `Sources:\n${sources}\n\nQuestion:\n${question}`;
+  // Prior turns give follow-ups their referents ("what about remote
+  // employees?") — but facts must still come from the numbered sources only.
+  const conversation =
+    history.length > 0
+      ? `Conversation so far (context only — cite the sources below, not this):\n${history
+          .map((turn) => `User: ${turn.question}\nAssistant: ${turn.answer}`)
+          .join("\n\n")}\n\n`
+      : "";
+
+  const user = `${conversation}Sources:\n${sources}\n\nQuestion:\n${question}`;
 
   return { system: systemPrompt, user };
 }

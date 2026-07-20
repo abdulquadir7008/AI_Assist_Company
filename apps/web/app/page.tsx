@@ -1,31 +1,53 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   askQuestion,
+  chatUploadDocument,
   CompanyDocument,
+  ConversationSummary,
+  deleteConversation,
   DepartmentName,
   downloadDocument,
+  getConversation,
+  getSuggestions,
+  listConversations,
   listDocuments,
   me,
   Role,
   Source,
-  uploadDocument
+  Suggestion,
+  uploadDocument,
+  validateAiKey
 } from "../lib/api";
-import { AuthSession, clearSession, getSession, setSession } from "../lib/session";
+import {
+  AuthSession,
+  clearOpenAiKey,
+  clearSession,
+  getOpenAiKey,
+  getSession,
+  setOpenAiKey,
+  setSession
+} from "../lib/session";
 import { AnswerWithSources } from "../components/AnswerWithSources";
 import {
   Bot,
   Building2,
   FileText,
+  FileUp,
+  KeyRound,
+  Lightbulb,
   Loader2,
   LogOut,
   MessageSquareText,
+  Paperclip,
+  Plus,
   RefreshCw,
   Search,
   Send,
   ShieldCheck,
+  Trash2,
   UploadCloud,
   UserRound,
   Wrench
@@ -35,7 +57,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 type ChatMessage = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "upload";
   content: string;
   sources?: Source[];
   grounded?: boolean;
@@ -61,45 +83,64 @@ const allDepartments: DepartmentName[] = [
   "LEADERSHIP"
 ];
 
+const greeting: ChatMessage = {
+  role: "assistant",
+  content:
+    "Ask a question about uploaded company documents — or drop a file here and ask about it right away."
+};
+
 export default function Home() {
   const router = useRouter();
   const [session, setSessionState] = useState<AuthSession | null>(null);
   const [documents, setDocuments] = useState<CompanyDocument[]>([]);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content: "Ask a question about uploaded company documents."
-    }
-  ]);
-  const [provider, setProvider] = useState<"openai" | "huggingface">("openai");
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([greeting]);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  // Hugging Face is the default; OpenAI activates only with a user-supplied key.
+  const [provider, setProvider] = useState<"openai" | "huggingface">("huggingface");
+  const [keyPanelOpen, setKeyPanelOpen] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [keySaving, setKeySaving] = useState(false);
+  const [retryQuestion, setRetryQuestion] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
   const [category, setCategory] = useState<(typeof categories)[number]>("HR_POLICY");
   const [uploadRoles, setUploadRoles] = useState<Role[]>([]);
   const [uploadDepartments, setUploadDepartments] = useState<DepartmentName[]>([]);
   const [title, setTitle] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [chatUploading, setChatUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const [answering, setAnswering] = useState(false);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const chatFileRef = useRef<HTMLInputElement>(null);
 
   const readyCount = useMemo(
     () => documents.filter((document) => document.status === "READY").length,
     [documents]
   );
 
+  const isEmptyChat = messages.length <= 1 && !answering;
+
   function signOut() {
     clearSession();
     router.replace("/login");
   }
 
-  function handleAuthFailure(caught: unknown, fallback: string) {
-    if (caught instanceof ApiError && caught.status === 401) {
-      signOut();
-      return;
-    }
-    setError(caught instanceof Error ? caught.message : fallback);
-  }
+  const handleAuthFailure = useCallback(
+    (caught: unknown, fallback: string) => {
+      if (caught instanceof ApiError && caught.status === 401) {
+        clearSession();
+        router.replace("/login");
+        return;
+      }
+      setError(caught instanceof Error ? caught.message : fallback);
+    },
+    [router]
+  );
 
   async function refreshDocuments(activeSession = session) {
     if (!activeSession) {
@@ -116,6 +157,18 @@ export default function Home() {
       setLoadingDocuments(false);
     }
   }
+
+  const refreshConversations = useCallback(
+    async (activeSession: AuthSession) => {
+      try {
+        const result = await listConversations(activeSession.token);
+        setConversations(result.conversations);
+      } catch (caught) {
+        handleAuthFailure(caught, "Could not load conversations.");
+      }
+    },
+    [handleAuthFailure]
+  );
 
   useEffect(() => {
     const cached = getSession();
@@ -140,7 +193,13 @@ export default function Home() {
           router.replace("/change-password");
           return;
         }
-        await refreshDocuments(refreshed);
+        await Promise.all([
+          refreshDocuments(refreshed),
+          refreshConversations(refreshed),
+          getSuggestions(refreshed.token)
+            .then((result) => setSuggestions(result.suggestions))
+            .catch(() => setSuggestions([]))
+        ]);
       } catch (caught) {
         if (caught instanceof ApiError && (caught.status === 401 || caught.status === 403)) {
           clearSession();
@@ -157,6 +216,105 @@ export default function Home() {
 
   const activeUser = session?.user ?? null;
   const isAdmin = activeUser?.roles.includes("ADMIN") ?? false;
+
+  function startNewChat() {
+    setActiveConversationId(null);
+    setMessages([greeting]);
+    setError(null);
+  }
+
+  function selectProvider(next: "openai" | "huggingface") {
+    if (next === "openai" && !getOpenAiKey()) {
+      // OpenAI only runs with a key — ask for it before switching.
+      setKeyError(null);
+      setKeyPanelOpen(true);
+      return;
+    }
+    setProvider(next);
+  }
+
+  async function saveOpenAiKey() {
+    if (!session || keySaving) {
+      return;
+    }
+    const trimmed = keyInput.trim();
+    if (!trimmed) {
+      setKeyError("Paste your OpenAI API key (starts with sk-).");
+      return;
+    }
+    setKeySaving(true);
+    setKeyError(null);
+    try {
+      // Validated with a test call before it is accepted.
+      await validateAiKey(session.token, { provider: "openai", apiKey: trimmed });
+      setOpenAiKey(trimmed);
+      setKeyInput("");
+      setKeyPanelOpen(false);
+      setProvider("openai");
+      // A question that failed on a bad key re-runs automatically now.
+      if (retryQuestion) {
+        const pending = retryQuestion;
+        setRetryQuestion(null);
+        void ask(pending, "openai");
+      }
+    } catch (caught) {
+      setKeyError(
+        caught instanceof ApiError && caught.code === "PROVIDER_KEY_INVALID"
+          ? "That key was rejected by OpenAI. Please enter a valid API key."
+          : caught instanceof Error
+            ? caught.message
+            : "Key validation failed."
+      );
+    } finally {
+      setKeySaving(false);
+    }
+  }
+
+  function disconnectOpenAi() {
+    clearOpenAiKey();
+    setProvider("huggingface");
+    setKeyPanelOpen(false);
+  }
+
+  async function openConversation(conversationId: string) {
+    if (!session) {
+      return;
+    }
+    setError(null);
+    try {
+      const result = await getConversation(session.token, conversationId);
+      setActiveConversationId(conversationId);
+      setMessages([
+        greeting,
+        ...result.conversation.messages.flatMap<ChatMessage>((message) => [
+          { role: "user", content: message.question },
+          {
+            role: "assistant",
+            content: message.answer,
+            sources: message.sources,
+            grounded: message.grounded
+          }
+        ])
+      ]);
+    } catch (caught) {
+      handleAuthFailure(caught, "Could not load conversation.");
+    }
+  }
+
+  async function removeConversation(conversationId: string) {
+    if (!session) {
+      return;
+    }
+    try {
+      await deleteConversation(session.token, conversationId);
+      if (activeConversationId === conversationId) {
+        startNewChat();
+      }
+      await refreshConversations(session);
+    } catch (caught) {
+      handleAuthFailure(caught, "Could not delete conversation.");
+    }
+  }
 
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -195,10 +353,46 @@ export default function Home() {
     }
   }
 
-  async function onAsk(event: FormEvent<HTMLFormElement>) {
+  async function onChatUpload(file: File) {
+    if (!session || chatUploading) {
+      return;
+    }
+    setChatUploading(true);
+    setError(null);
+    setMessages((current) => [
+      ...current,
+      { role: "upload", content: `Uploading “${file.name}”…` }
+    ]);
+    try {
+      const result = await chatUploadDocument(session.token, file);
+      setMessages((current) => [
+        ...current.slice(0, -1),
+        {
+          role: "upload",
+          content: `“${result.document.title}” is indexed and private to you (an admin can share it wider). Ask away.`
+        }
+      ]);
+      await refreshDocuments(session);
+    } catch (caught) {
+      setMessages((current) => current.slice(0, -1));
+      handleAuthFailure(caught, "Upload failed.");
+    } finally {
+      setChatUploading(false);
+    }
+  }
+
+  function onDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
-    const trimmed = question.trim();
-    if (!session || !trimmed) {
+    setDragActive(false);
+    const file = event.dataTransfer.files?.[0];
+    if (file) {
+      void onChatUpload(file);
+    }
+  }
+
+  async function ask(text: string, askProvider: "openai" | "huggingface" = provider) {
+    const trimmed = text.trim();
+    if (!session || !trimmed || answering) {
       return;
     }
 
@@ -208,7 +402,16 @@ export default function Home() {
     setError(null);
 
     try {
-      const result = await askQuestion(session.token, { question: trimmed, provider });
+      const result = await askQuestion(
+        session.token,
+        {
+          question: trimmed,
+          provider: askProvider,
+          ...(activeConversationId ? { conversationId: activeConversationId } : {})
+        },
+        getOpenAiKey()
+      );
+      setActiveConversationId(result.conversationId);
       setMessages((current) => [
         ...current,
         {
@@ -218,11 +421,34 @@ export default function Home() {
           grounded: result.grounded
         }
       ]);
+      await refreshConversations(session);
     } catch (caught) {
+      // A rejected/missing OpenAI key is NOT a session failure: withdraw the
+      // question, ask for a valid key, and re-run automatically once saved.
+      if (
+        caught instanceof ApiError &&
+        (caught.code === "PROVIDER_KEY_INVALID" || caught.code === "PROVIDER_KEY_REQUIRED")
+      ) {
+        clearOpenAiKey();
+        setMessages((current) => current.slice(0, -1));
+        setRetryQuestion(trimmed);
+        setKeyError(
+          caught.code === "PROVIDER_KEY_INVALID"
+            ? "Your OpenAI key was rejected. Enter a valid key and your question will run."
+            : "OpenAI needs your API key. Enter it and your question will run."
+        );
+        setKeyPanelOpen(true);
+        return;
+      }
       handleAuthFailure(caught, "Question failed.");
     } finally {
       setAnswering(false);
     }
+  }
+
+  async function onAsk(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await ask(question);
   }
 
   async function onDownload(documentId: string, filename: string) {
@@ -300,6 +526,63 @@ export default function Home() {
 
       <div className="mx-auto grid max-w-7xl gap-5 px-5 py-5 lg:grid-cols-[380px_minmax(0,1fr)]">
         <section className="space-y-5">
+          <div className="rounded border border-line bg-white shadow-panel">
+            <div className="flex items-center justify-between border-b border-line px-4 py-3">
+              <h2 className="text-base font-semibold text-ink">Conversations</h2>
+              <button
+                type="button"
+                onClick={startNewChat}
+                className="flex items-center gap-1 rounded border border-line px-2 py-1 text-xs font-medium text-muted hover:border-accent hover:text-accent"
+              >
+                <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                New chat
+              </button>
+            </div>
+            <div className="max-h-[220px] overflow-y-auto p-2">
+              {conversations.length === 0 ? (
+                <p className="rounded border border-dashed border-line p-3 text-xs text-muted">
+                  No conversations yet — your chats are saved per user.
+                </p>
+              ) : (
+                <ul className="space-y-1">
+                  {conversations.map((conversation) => (
+                    <li key={conversation.id} className="group flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => void openConversation(conversation.id)}
+                        className={clsx(
+                          "min-w-0 flex-1 truncate rounded px-2 py-1.5 text-left text-sm",
+                          conversation.id === activeConversationId
+                            ? "bg-ink text-white"
+                            : "text-ink hover:bg-paper"
+                        )}
+                        title={conversation.title}
+                      >
+                        {conversation.title}
+                        <span
+                          className={clsx(
+                            "ml-2 text-xs",
+                            conversation.id === activeConversationId ? "text-white/70" : "text-muted"
+                          )}
+                        >
+                          {conversation.messageCount}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void removeConversation(conversation.id)}
+                        className="invisible grid h-7 w-7 shrink-0 place-items-center rounded text-muted hover:text-red-600 group-hover:visible"
+                        title="Delete conversation"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
           <div className="rounded border border-line bg-white p-4 shadow-panel">
             <div className="mb-4 flex items-center justify-between">
               <h2 className="text-base font-semibold text-ink">Documents</h2>
@@ -318,7 +601,8 @@ export default function Home() {
 
             {!isAdmin ? (
               <p className="rounded border border-dashed border-line p-3 text-xs text-muted">
-                Only admins can upload documents. Ask a workspace admin to add content.
+                Drop a file into the chat to ask about it — it stays private to you. Only admins
+                can publish documents for the whole company.
               </p>
             ) : (
             <form className="space-y-3" onSubmit={onUpload}>
@@ -416,7 +700,7 @@ export default function Home() {
             <div className="border-b border-line px-4 py-3">
               <h2 className="text-base font-semibold text-ink">Library</h2>
             </div>
-            <div className="max-h-[430px] overflow-y-auto p-3">
+            <div className="max-h-[300px] overflow-y-auto p-3">
               {documents.length === 0 ? (
                 <div className="rounded border border-dashed border-line p-4 text-sm text-muted">
                   No documents indexed yet.
@@ -459,28 +743,129 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="flex min-h-[680px] flex-col rounded border border-line bg-white shadow-panel">
+        <section
+          className="relative flex min-h-[680px] flex-col rounded border border-line bg-white shadow-panel"
+          onDragOver={(event) => {
+            event.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={(event) => {
+            if (event.currentTarget === event.target) {
+              setDragActive(false);
+            }
+          }}
+          onDrop={onDrop}
+        >
+          {dragActive ? (
+            <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded border-2 border-dashed border-accent bg-accent/5">
+              <div className="flex items-center gap-2 rounded bg-white px-4 py-3 text-sm font-semibold text-accent shadow-panel">
+                <FileUp className="h-5 w-5" aria-hidden="true" />
+                Drop to upload — private to you, ask about it immediately
+              </div>
+            </div>
+          ) : null}
+
           <div className="flex flex-col gap-3 border-b border-line px-4 py-3 md:flex-row md:items-center md:justify-between">
             <div className="flex items-center gap-2">
               <MessageSquareText className="h-5 w-5 text-accent" aria-hidden="true" />
               <h2 className="text-base font-semibold text-ink">Assistant</h2>
             </div>
-            <div className="inline-flex w-fit rounded border border-line p-1">
-              {(["openai", "huggingface"] as const).map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => setProvider(item)}
-                  className={clsx(
-                    "rounded px-3 py-1.5 text-sm font-medium capitalize",
-                    provider === item ? "bg-ink text-white" : "text-muted hover:text-ink"
-                  )}
-                >
-                  {item === "openai" ? "OpenAI" : "Hugging Face"}
-                </button>
-              ))}
+            <div className="flex items-center gap-2">
+              <div className="inline-flex w-fit rounded border border-line p-1">
+                {(["huggingface", "openai"] as const).map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => selectProvider(item)}
+                    className={clsx(
+                      "rounded px-3 py-1.5 text-sm font-medium capitalize",
+                      provider === item ? "bg-ink text-white" : "text-muted hover:text-ink"
+                    )}
+                    title={
+                      item === "openai" ? "Runs with your own OpenAI API key" : "Default model"
+                    }
+                  >
+                    {item === "openai" ? "OpenAI" : "Hugging Face"}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setKeyError(null);
+                  setKeyPanelOpen((open) => !open);
+                }}
+                className={clsx(
+                  "grid h-9 w-9 place-items-center rounded border border-line hover:border-accent hover:text-accent",
+                  provider === "openai" ? "text-accent" : "text-muted"
+                )}
+                title="OpenAI API key"
+              >
+                <KeyRound className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
           </div>
+
+          {keyPanelOpen ? (
+            <div className="border-b border-line bg-paper px-4 py-3">
+              <p className="mb-2 text-xs text-muted">
+                OpenAI runs with <span className="font-semibold text-ink">your own API key</span>.
+                It is checked with a test call, kept only in this browser, sent with your
+                questions, and never stored on the server.
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="password"
+                  value={keyInput}
+                  onChange={(event) => setKeyInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveOpenAiKey();
+                    }
+                  }}
+                  placeholder={getOpenAiKey() ? "Key saved — paste a new key to replace" : "sk-…"}
+                  className="min-w-[260px] flex-1 rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+                />
+                <button
+                  type="button"
+                  onClick={() => void saveOpenAiKey()}
+                  disabled={keySaving}
+                  className="flex items-center gap-1.5 rounded bg-accent px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
+                >
+                  {keySaving ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  ) : null}
+                  {keySaving ? "Checking…" : "Save & use OpenAI"}
+                </button>
+                {getOpenAiKey() ? (
+                  <button
+                    type="button"
+                    onClick={disconnectOpenAi}
+                    className="rounded border border-line px-3 py-2 text-sm font-medium text-red-700 hover:border-red-400"
+                  >
+                    Remove key
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setKeyPanelOpen(false);
+                      setRetryQuestion(null);
+                    }}
+                    className="rounded border border-line px-3 py-2 text-sm font-medium text-muted hover:border-accent hover:text-accent"
+                  >
+                    Keep Hugging Face
+                  </button>
+                )}
+              </div>
+              {keyError ? (
+                <p className="mt-2 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  {keyError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
             {messages.map((message, index) => (
@@ -496,32 +881,62 @@ export default function Home() {
                     <Bot className="h-4 w-4" aria-hidden="true" />
                   </div>
                 ) : null}
-                <div
-                  className={clsx(
-                    "max-w-[820px] rounded border px-4 py-3 text-sm leading-6",
-                    message.role === "user"
-                      ? "border-ink bg-ink text-white"
-                      : "border-line bg-paper text-ink"
-                  )}
-                >
-                  {message.role === "assistant" ? (
-                    <AnswerWithSources
-                      content={message.content}
-                      sources={message.sources ?? []}
-                      grounded={message.grounded ?? true}
-                      messageIndex={index}
-                      onDownload={(documentId, filename) => void onDownload(documentId, filename)}
-                    />
-                  ) : (
-                    <p className="whitespace-pre-wrap">{message.content}</p>
-                  )}
-                </div>
+                {message.role === "upload" ? (
+                  <div className="flex items-center gap-2 rounded border border-dashed border-accent/50 bg-accent/5 px-4 py-2 text-sm text-ink">
+                    <Paperclip className="h-4 w-4 text-accent" aria-hidden="true" />
+                    {message.content}
+                  </div>
+                ) : (
+                  <div
+                    className={clsx(
+                      "max-w-[820px] rounded border px-4 py-3 text-sm leading-6",
+                      message.role === "user"
+                        ? "border-ink bg-ink text-white"
+                        : "border-line bg-paper text-ink"
+                    )}
+                  >
+                    {message.role === "assistant" ? (
+                      <AnswerWithSources
+                        content={message.content}
+                        sources={message.sources ?? []}
+                        grounded={message.grounded ?? true}
+                        messageIndex={index}
+                        onDownload={(documentId, filename) => void onDownload(documentId, filename)}
+                      />
+                    ) : (
+                      <p className="whitespace-pre-wrap">{message.content}</p>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
             {answering ? (
               <div className="flex items-center gap-2 text-sm text-muted">
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
                 Retrieving context
+              </div>
+            ) : null}
+
+            {isEmptyChat && suggestions.length > 0 ? (
+              <div className="rounded border border-dashed border-line p-4">
+                <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-muted">
+                  <Lightbulb className="h-3.5 w-3.5 text-signal" aria-hidden="true" />
+                  {suggestions.some((item) => item.source === "popular")
+                    ? "Popular in your department"
+                    : "Try asking"}
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {suggestions.map((suggestion) => (
+                    <button
+                      key={suggestion.question}
+                      type="button"
+                      onClick={() => void ask(suggestion.question)}
+                      className="rounded-full border border-line px-3 py-1.5 text-sm text-ink hover:border-accent hover:text-accent"
+                    >
+                      {suggestion.question}
+                    </button>
+                  ))}
+                </div>
               </div>
             ) : null}
           </div>
@@ -534,11 +949,41 @@ export default function Home() {
 
           <form className="border-t border-line p-4" onSubmit={onAsk}>
             <div className="flex gap-3">
+              <input
+                ref={chatFileRef}
+                type="file"
+                className="hidden"
+                accept=".pdf,.docx,.txt,.md,.csv,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    void onChatUpload(file);
+                  }
+                  event.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => chatFileRef.current?.click()}
+                disabled={chatUploading || !session}
+                className="grid h-12 w-12 shrink-0 place-items-center rounded border border-line text-muted hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-60"
+                title="Attach a document (private to you)"
+              >
+                {chatUploading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Paperclip className="h-4 w-4" aria-hidden="true" />
+                )}
+              </button>
               <textarea
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
                 rows={2}
-                placeholder="What is our refund policy?"
+                placeholder={
+                  activeConversationId
+                    ? "Ask a follow-up — the conversation remembers context"
+                    : "What is our refund policy?"
+                }
                 className="min-h-12 flex-1 resize-none rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
               />
               <button

@@ -11,18 +11,33 @@ import {
   adminAudit,
   adminBulkAccess,
   adminCreateUser,
+  adminGetDigest,
   adminListDocuments,
   adminListUsers,
+  adminSendDigestNow,
+  adminUpdateDigest,
   adminUpdateDocumentAccess,
   adminUpdateUser,
   ApiError,
   AuditEntry,
   CompanyUser,
   DepartmentName,
+  DigestRun,
   Role
 } from "../../lib/api";
 import { AuthSession, clearSession, getSession } from "../../lib/session";
-import { ArrowLeft, BadgeCheck, Check, Loader2, ShieldCheck, UserPlus, X } from "lucide-react";
+import {
+  ArrowLeft,
+  BadgeCheck,
+  BellRing,
+  Check,
+  Loader2,
+  Paperclip,
+  Send,
+  ShieldCheck,
+  UserPlus,
+  X
+} from "lucide-react";
 
 const allRoles: Role[] = ["ADMIN", "HR", "LEGAL", "MANAGER", "EMPLOYEE", "CONTRACTOR"];
 const allDepartments: DepartmentName[] = [
@@ -35,7 +50,7 @@ const allDepartments: DepartmentName[] = [
   "LEADERSHIP"
 ];
 
-const tabs = ["Users", "Documents", "Access Matrix", "Audit"] as const;
+const tabs = ["Users", "Documents", "Access Matrix", "Digest", "Audit"] as const;
 type Tab = (typeof tabs)[number];
 
 export default function AdminPage() {
@@ -46,6 +61,13 @@ export default function AdminPage() {
   const [documents, setDocuments] = useState<AdminDocument[]>([]);
   const [matrix, setMatrix] = useState<AccessMatrix | null>(null);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
+  const [digest, setDigest] = useState<{
+    digestsEnabled: boolean;
+    slackConfigured: boolean;
+    runs: DigestRun[];
+  } | null>(null);
+  const [slackUrl, setSlackUrl] = useState("");
+  const [digestResult, setDigestResult] = useState<string | null>(null);
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,16 +91,19 @@ export default function AdminPage() {
       setBusy(true);
       setError(null);
       try {
-        const [usersResult, documentsResult, matrixResult, auditResult] = await Promise.all([
-          adminListUsers(activeSession.token),
-          adminListDocuments(activeSession.token),
-          adminAccessMatrix(activeSession.token),
-          adminAudit(activeSession.token)
-        ]);
+        const [usersResult, documentsResult, matrixResult, auditResult, digestSettings] =
+          await Promise.all([
+            adminListUsers(activeSession.token),
+            adminListDocuments(activeSession.token),
+            adminAccessMatrix(activeSession.token),
+            adminAudit(activeSession.token),
+            adminGetDigest(activeSession.token)
+          ]);
         setUsers(usersResult.users);
         setDocuments(documentsResult.documents);
         setMatrix(matrixResult);
         setAuditEntries(auditResult.entries);
+        setDigest(digestSettings);
       } catch (caught) {
         if (caught instanceof ApiError && caught.status === 401) {
           clearSession();
@@ -391,6 +416,144 @@ export default function AdminPage() {
           </section>
         ) : null}
 
+        {tab === "Digest" && session && digest ? (
+          <section className="space-y-3">
+            <div className="rounded border border-line bg-white p-4 shadow-panel">
+              <h2 className="mb-1 flex items-center gap-2 text-base font-semibold text-ink">
+                <BellRing className="h-4 w-4 text-accent" aria-hidden="true" />
+                Weekly digest
+              </h2>
+              <p className="mb-3 text-xs text-muted">
+                Every Monday morning, users get an email listing documents added or reclassified in
+                the past week — each person only sees documents their own roles can access. The
+                optional Slack webhook posts a company-wide summary (restricted and private
+                documents are never included).
+              </p>
+
+              <label className="mb-3 flex items-center gap-2 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  checked={digest.digestsEnabled}
+                  disabled={busy}
+                  onChange={(event) =>
+                    void run(async () => {
+                      const result = await adminUpdateDigest(session.token, {
+                        digestsEnabled: event.target.checked
+                      });
+                      setDigest((current) =>
+                        current ? { ...current, digestsEnabled: result.digestsEnabled } : current
+                      );
+                    }, "Digest settings saved.")
+                  }
+                />
+                Weekly digests enabled
+              </label>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="url"
+                  value={slackUrl}
+                  onChange={(event) => setSlackUrl(event.target.value)}
+                  placeholder={
+                    digest.slackConfigured
+                      ? "Slack webhook configured — paste a new URL to replace"
+                      : "https://hooks.slack.com/services/…"
+                  }
+                  className="min-w-[280px] flex-1 rounded border border-line px-3 py-2 text-sm outline-none focus:border-accent"
+                />
+                <button
+                  type="button"
+                  disabled={busy || !slackUrl}
+                  onClick={() =>
+                    void run(async () => {
+                      const result = await adminUpdateDigest(session.token, {
+                        slackWebhookUrl: slackUrl
+                      });
+                      setDigest((current) =>
+                        current ? { ...current, slackConfigured: result.slackConfigured } : current
+                      );
+                      setSlackUrl("");
+                    }, "Slack webhook saved.")
+                  }
+                  className="rounded bg-accent px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                >
+                  Save webhook
+                </button>
+                {digest.slackConfigured ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        await adminUpdateDigest(session.token, { slackWebhookUrl: "" });
+                        setDigest((current) =>
+                          current ? { ...current, slackConfigured: false } : current
+                        );
+                      }, "Slack webhook removed.")
+                    }
+                    className="rounded border border-line px-3 py-2 text-xs font-medium text-red-700 hover:border-red-400"
+                  >
+                    Remove
+                  </button>
+                ) : null}
+              </div>
+
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      const result = await adminSendDigestNow(session.token);
+                      setDigestResult(
+                        `Covered ${result.documentCount} document(s): ${result.emailsSent} email(s) sent, ${result.emailsSkipped} recipient(s) had no relevant changes${result.slackSent ? ", Slack posted" : ""}.`
+                      );
+                    }, "Digest run completed.")
+                  }
+                  className="flex items-center gap-1.5 rounded border border-line px-3 py-2 text-sm font-medium text-ink hover:border-accent hover:text-accent disabled:opacity-60"
+                >
+                  <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                  Send digest now (last 7 days)
+                </button>
+                {digestResult ? <p className="text-xs text-muted">{digestResult}</p> : null}
+              </div>
+            </div>
+
+            <div className="rounded border border-line bg-white p-4 shadow-panel">
+              <h3 className="mb-2 text-sm font-semibold text-ink">Recent runs</h3>
+              {digest.runs.length === 0 ? (
+                <p className="text-sm text-muted">No digests sent yet.</p>
+              ) : (
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-line text-muted">
+                      <th className="py-2 pr-3 font-medium">Sent</th>
+                      <th className="py-2 pr-3 font-medium">Period</th>
+                      <th className="py-2 pr-3 font-medium">Docs</th>
+                      <th className="py-2 pr-3 font-medium">Emails</th>
+                      <th className="py-2 font-medium">Slack</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {digest.runs.map((run) => (
+                      <tr key={run.id} className="border-b border-line/60 text-ink">
+                        <td className="py-2 pr-3">{new Date(run.createdAt).toLocaleString()}</td>
+                        <td className="py-2 pr-3">
+                          {new Date(run.periodStart).toLocaleDateString()} –{" "}
+                          {new Date(run.periodEnd).toLocaleDateString()}
+                        </td>
+                        <td className="py-2 pr-3">{run.documentCount}</td>
+                        <td className="py-2 pr-3">{run.emailsSent}</td>
+                        <td className="py-2">{run.slackSent ? "✓" : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </section>
+        ) : null}
+
         {tab === "Audit" && session ? (
           <section className="rounded border border-line bg-white p-4 shadow-panel">
             <h2 className="mb-3 text-base font-semibold text-ink">Audit log</h2>
@@ -616,9 +779,17 @@ function DocumentAclCard({
             onChange={(event) => onToggleSelect(event.target.checked)}
           />
           <span className="truncate text-sm font-semibold text-ink">{document.title}</span>
+          {document.source === "CHAT" ? (
+            <span className="flex shrink-0 items-center gap-1 rounded bg-accent/10 px-1.5 py-0.5 text-[11px] font-medium text-accent">
+              <Paperclip className="h-3 w-3" aria-hidden="true" />
+              chat upload{document.ownerEmail ? ` · ${document.ownerEmail}` : ""}
+            </span>
+          ) : null}
           {document.unclassified ? (
             <span className="shrink-0 rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700">
-              Unclassified — admin-only (legacy hint: {document.legacyVisibilityHint})
+              {document.source === "CHAT"
+                ? "Private to uploader until shared"
+                : `Unclassified — admin-only (legacy hint: ${document.legacyVisibilityHint})`}
             </span>
           ) : null}
         </label>

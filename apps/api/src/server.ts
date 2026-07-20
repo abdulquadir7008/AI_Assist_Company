@@ -1,7 +1,10 @@
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
+import { ZodError } from "zod";
+import { ProviderAuthError } from "./ai/providers.js";
 import { config } from "./config.js";
+import { startDigestScheduler } from "./digest/scheduler.js";
 import { authenticate, HttpError } from "./http/auth.js";
 import { adminRouter } from "./http/admin.js";
 import { authLimiter, authRouter } from "./http/authRoutes.js";
@@ -46,6 +49,19 @@ app.use(
       response.status(error.status).json({ error: error.message });
       return;
     }
+    // Provider credential problems → 401 with a code the web app uses to
+    // prompt the user for a valid API key (distinct from a session 401).
+    if (error instanceof ProviderAuthError) {
+      response.status(401).json({ error: error.message, code: error.code, provider: error.provider });
+      return;
+    }
+    // Request-shape problems are the caller's fault, with a readable message.
+    if (error instanceof ZodError) {
+      const first = error.issues[0];
+      const field = first?.path.join(".") || "request";
+      response.status(400).json({ error: `Invalid ${field}: ${first?.message ?? "bad request"}` });
+      return;
+    }
     const message = error instanceof Error ? error.message : "Unexpected server error.";
     response.status(500).json({ error: message });
   }
@@ -53,6 +69,7 @@ app.use(
 
 async function start() {
   await seedRootAdmin();
+  startDigestScheduler();
   app.listen(config.apiPort, () => {
     console.log(`RAG API listening on http://localhost:${config.apiPort}`);
   });

@@ -4,6 +4,33 @@ import { config } from "../config.js";
 export type SendCodeResult = { delivered: boolean; devCode?: string };
 
 /**
+ * Generic mail delivery with the same SMTP/dev fallback as verification
+ * codes: without SMTP configured the message is logged, not sent.
+ * Returns whether a real email went out.
+ */
+export async function sendMail(input: {
+  to: string;
+  subject: string;
+  text: string;
+}): Promise<boolean> {
+  const { host, port, user, pass, from } = config.smtp;
+
+  if (host && user && pass) {
+    const transport = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      auth: { user, pass }
+    });
+    await transport.sendMail({ from, to: input.to, subject: input.subject, text: input.text });
+    return true;
+  }
+
+  console.log(`[mailer] (dev) to=${input.to} subject="${input.subject}"\n${input.text}`);
+  return false;
+}
+
+/**
  * Dev-friendly delivery: with SMTP configured (SMTP_HOST/USER/PASS), a real
  * email is sent. Without it, the code is logged to the API console and
  * returned so routes can surface it as devVerificationCode — dev only.

@@ -17,6 +17,7 @@ const openToAll: Acl = {
   allowedRoles: Object.values(Role),
   allowedDepartments: Object.values(Department)
 };
+const ownedByU9: Acl = { allowedRoles: [Role.ADMIN], allowedDepartments: [], ownerId: "u9" };
 
 function principal(roles: Role[], department: Department = Department.GENERAL): Principal {
   return { userId: "u1", companyId: "c1", roles, department };
@@ -24,7 +25,7 @@ function principal(roles: Role[], department: Department = Department.GENERAL): 
 
 describe("canAccess", () => {
   it("ADMIN can access everything, including admin-only and empty ACLs", () => {
-    for (const acl of [hrOnly, legalAndHr, engineeringDeptOnly, adminOnly, openToAll]) {
+    for (const acl of [hrOnly, legalAndHr, engineeringDeptOnly, adminOnly, openToAll, ownedByU9]) {
       expect(canAccess(principal([Role.ADMIN]), acl)).toBe(true);
     }
   });
@@ -57,6 +58,23 @@ describe("canAccess", () => {
     expect(canAccess(principal([]), hrOnly)).toBe(false);
     expect(canAccess(principal([]), adminOnly)).toBe(false);
   });
+
+  it("owner lane: the uploader keeps access to an otherwise admin-only doc", () => {
+    const owner: Principal = { userId: "u9", companyId: "c1", roles: [Role.CONTRACTOR], department: Department.GENERAL };
+    expect(canAccess(owner, ownedByU9)).toBe(true);
+  });
+
+  it("owner lane: any other non-admin user is still denied", () => {
+    expect(canAccess(principal([Role.EMPLOYEE]), ownedByU9)).toBe(false);
+    expect(canAccess(principal([Role.CONTRACTOR]), ownedByU9)).toBe(false);
+  });
+
+  it("owner lane: null/absent ownerId grants nothing", () => {
+    expect(canAccess(principal([Role.EMPLOYEE]), { ...hrOnly, ownerId: null })).toBe(false);
+    // An empty-string ownerId (Chroma's null encoding) must never match either.
+    const emptyOwner: Principal = { userId: "", companyId: "c1", roles: [], department: Department.GENERAL };
+    expect(canAccess(emptyOwner, { allowedRoles: [], allowedDepartments: [], ownerId: null })).toBe(false);
+  });
 });
 
 describe("effectiveChunkAcl", () => {
@@ -75,9 +93,20 @@ describe("effectiveChunkAcl", () => {
       overrideRoles: [],
       overrideDepartments: []
     });
-    expect(narrowed).toEqual({ allowedRoles: [], allowedDepartments: [] });
+    expect(narrowed).toEqual({ allowedRoles: [], allowedDepartments: [], ownerId: null });
     expect(canAccess(principal([Role.EMPLOYEE]), narrowed)).toBe(false);
     expect(canAccess(principal([Role.ADMIN]), narrowed)).toBe(true);
+  });
+
+  it("the owner lane survives a chunk override", () => {
+    const overridden = effectiveChunkAcl(ownedByU9, {
+      aclOverride: true,
+      overrideRoles: [],
+      overrideDepartments: []
+    });
+    expect(overridden.ownerId).toBe("u9");
+    const owner: Principal = { userId: "u9", companyId: "c1", roles: [Role.EMPLOYEE], department: Department.GENERAL };
+    expect(canAccess(owner, overridden)).toBe(true);
   });
 });
 
@@ -95,8 +124,15 @@ describe("aclToChromaFlags", () => {
   it("acl_role_ADMIN is always true even for an empty ACL", () => {
     const flags = aclToChromaFlags({ allowedRoles: [], allowedDepartments: [] });
     expect(flags.acl_role_ADMIN).toBe(true);
-    const denied = Object.entries(flags).filter(([key]) => key !== "acl_role_ADMIN");
+    const denied = Object.entries(flags).filter(
+      ([key]) => key !== "acl_role_ADMIN" && key !== "owner_id"
+    );
     expect(denied.every(([, value]) => value === false)).toBe(true);
+  });
+
+  it("owner_id is always present: the uploader id, or empty string for no owner", () => {
+    expect(aclToChromaFlags(ownedByU9).owner_id).toBe("u9");
+    expect(aclToChromaFlags(hrOnly).owner_id).toBe("");
   });
 });
 
@@ -107,7 +143,7 @@ describe("buildChromaAccessFilter", () => {
     });
   });
 
-  it("contractor filter contains exactly its role flag and department flag", () => {
+  it("contractor filter contains exactly its role flag, department flag, and owner lane", () => {
     const filter = buildChromaAccessFilter(principal([Role.CONTRACTOR], Department.GENERAL));
     expect(filter).toEqual({
       $and: [
@@ -115,21 +151,25 @@ describe("buildChromaAccessFilter", () => {
         {
           $or: [
             { acl_role_CONTRACTOR: { $eq: true } },
-            { acl_dept_GENERAL: { $eq: true } }
+            { acl_dept_GENERAL: { $eq: true } },
+            { owner_id: { $eq: "u1" } }
           ]
         }
       ]
     });
   });
 
-  it("unwraps a single-clause grant (Chroma rejects 1-element $or)", () => {
+  it("a role-less user still gets department + owner clauses", () => {
     const filter = buildChromaAccessFilter(principal([], Department.SALES));
     expect(filter).toEqual({
-      $and: [{ companyId: { $eq: "c1" } }, { acl_dept_SALES: { $eq: true } }]
+      $and: [
+        { companyId: { $eq: "c1" } },
+        { $or: [{ acl_dept_SALES: { $eq: true } }, { owner_id: { $eq: "u1" } }] }
+      ]
     });
   });
 
-  it("multi-role user gets one clause per role plus the department", () => {
+  it("multi-role user gets one clause per role plus department and owner", () => {
     const filter = buildChromaAccessFilter(principal([Role.HR, Role.MANAGER], Department.HR));
     expect(filter).toEqual({
       $and: [
@@ -138,7 +178,8 @@ describe("buildChromaAccessFilter", () => {
           $or: [
             { acl_role_HR: { $eq: true } },
             { acl_role_MANAGER: { $eq: true } },
-            { acl_dept_HR: { $eq: true } }
+            { acl_dept_HR: { $eq: true } },
+            { owner_id: { $eq: "u1" } }
           ]
         }
       ]

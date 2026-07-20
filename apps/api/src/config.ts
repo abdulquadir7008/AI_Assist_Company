@@ -39,6 +39,9 @@ export const config = {
   enableDemoSetup:
     (process.env.ENABLE_DEMO_SETUP ?? (process.env.NODE_ENV === "production" ? "false" : "true")) ===
     "true",
+  // Link target used in digest emails/Slack messages.
+  webUrl: process.env.WEB_URL ?? "http://localhost:3000",
+  disableDigestScheduler: process.env.DISABLE_DIGEST_SCHEDULER === "true",
   openai: {
     apiKey: process.env.OPENAI_API_KEY,
     chatModel: process.env.OPENAI_CHAT_MODEL ?? "gpt-4o-mini",

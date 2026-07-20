@@ -32,7 +32,7 @@ services:
       API_PORT: 4000
       CHROMA_URL: http://chroma:8000
       CHROMA_COLLECTION: ${CHROMA_COLLECTION:-company_documents}
-      DEFAULT_AI_PROVIDER: ${DEFAULT_AI_PROVIDER:-openai}
+      DEFAULT_AI_PROVIDER: ${DEFAULT_AI_PROVIDER:-huggingface}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
@@ -49,6 +49,8 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      WEB_URL: ${WEB_URL:-http://localhost:3000}
+      DISABLE_DIGEST_SCHEDULER: ${DISABLE_DIGEST_SCHEDULER:-false}
     ports:
       - "4000:4000"
     volumes:

@@ -49,3 +49,12 @@ export const getRootSession = () => read<RootSession>(ROOT_SESSION_KEY);
 export const setRootSession = (session: RootSession) =>
   window.localStorage.setItem(ROOT_SESSION_KEY, JSON.stringify(session));
 export const clearRootSession = () => window.localStorage.removeItem(ROOT_SESSION_KEY);
+
+// The user's own OpenAI key: kept in THIS browser only, sent per request,
+// never persisted server-side.
+const OPENAI_KEY_KEY = "company-rag-openai-key-v1";
+
+export const getOpenAiKey = () =>
+  typeof window === "undefined" ? null : window.localStorage.getItem(OPENAI_KEY_KEY);
+export const setOpenAiKey = (key: string) => window.localStorage.setItem(OPENAI_KEY_KEY, key);
+export const clearOpenAiKey = () => window.localStorage.removeItem(OPENAI_KEY_KEY);

@@ -11,6 +11,8 @@ import { z } from "zod";
 import { canAccess, effectiveChunkAcl, type Acl } from "../access/policy.js";
 import { audit } from "../audit/audit.js";
 import { hashPassword } from "../auth/passwords.js";
+import { config } from "../config.js";
+import { runDigestForCompany } from "../digest/digest.js";
 import { updateChunkMetadata } from "../rag/chroma.js";
 import { buildChunkMetadata } from "../rag/metadata.js";
 import { asyncHandler } from "./asyncHandler.js";
@@ -41,7 +43,8 @@ async function syncDocumentChunksToChroma(documentIds: string[]) {
     });
     const docAcl: Acl = {
       allowedRoles: document.allowedRoles,
-      allowedDepartments: document.allowedDepartments
+      allowedDepartments: document.allowedDepartments,
+      ownerId: document.ownerId
     };
 
     for (let start = 0; start < document.chunks.length; start += CHROMA_UPDATE_BATCH) {
@@ -191,6 +194,13 @@ adminRouter.get(
       }
     });
 
+    // Resolve chat-upload owners to emails for the admin view.
+    const ownerIds = [...new Set(documents.map((d) => d.ownerId).filter((id): id is string => !!id))];
+    const owners = ownerIds.length
+      ? await prisma.user.findMany({ where: { id: { in: ownerIds } }, select: { id: true, email: true } })
+      : [];
+    const ownerEmail = new Map(owners.map((owner) => [owner.id, owner.email]));
+
     response.json({
       documents: documents.map((document) => ({
         id: document.id,
@@ -203,6 +213,8 @@ adminRouter.get(
         unclassified: document.classifiedAt === null,
         classifiedAt: document.classifiedAt,
         legacyVisibilityHint: document.visibility,
+        source: document.source,
+        ownerEmail: document.ownerId ? (ownerEmail.get(document.ownerId) ?? null) : null,
         chunkCount: document._count.chunks,
         overriddenChunks: document.chunks,
         createdAt: document.createdAt
@@ -345,7 +357,8 @@ adminRouter.patch(
 
     const docAcl: Acl = {
       allowedRoles: chunk.document.allowedRoles,
-      allowedDepartments: chunk.document.allowedDepartments
+      allowedDepartments: chunk.document.allowedDepartments,
+      ownerId: chunk.document.ownerId
     };
     try {
       await updateChunkMetadata({
@@ -409,21 +422,96 @@ adminRouter.get(
           id: document.id,
           title: document.title,
           unclassified: document.classifiedAt === null,
+          // Synthetic principals get an impossible userId so the owner lane
+          // never influences role/department columns.
           access: Object.fromEntries(
             roles.map((role) => [
               role,
-              canAccess({ roles: [role], department: neutralDepartment }, document)
+              canAccess({ userId: "", roles: [role], department: neutralDepartment }, document)
             ])
           ),
           departmentAccess: Object.fromEntries(
             departments.map((department) => [
               department,
-              canAccess({ roles: [], department }, document)
+              canAccess({ userId: "", roles: [], department }, document)
             ])
           )
         };
       })
     });
+  })
+);
+
+// ---- Proactive digests ----
+
+adminRouter.get(
+  "/digest",
+  asyncHandler(async (_request, response) => {
+    const principal = getPrincipal(response);
+    const company = await prisma.company.findUniqueOrThrow({
+      where: { id: principal.companyId },
+      select: { digestsEnabled: true, slackWebhookUrl: true }
+    });
+    const runs = await prisma.digestRun.findMany({
+      where: { companyId: principal.companyId },
+      orderBy: { createdAt: "desc" },
+      take: 10
+    });
+    response.json({
+      digestsEnabled: company.digestsEnabled,
+      slackConfigured: Boolean(company.slackWebhookUrl),
+      runs
+    });
+  })
+);
+
+adminRouter.patch(
+  "/digest",
+  asyncHandler(async (request, response) => {
+    const principal = getPrincipal(response);
+    const body = z
+      .object({
+        digestsEnabled: z.boolean().optional(),
+        // Empty string clears the webhook.
+        slackWebhookUrl: z
+          .union([z.literal(""), z.string().url().startsWith("https://")])
+          .optional()
+      })
+      .parse(request.body);
+
+    const company = await prisma.company.update({
+      where: { id: principal.companyId },
+      data: {
+        ...(body.digestsEnabled !== undefined ? { digestsEnabled: body.digestsEnabled } : {}),
+        ...(body.slackWebhookUrl !== undefined
+          ? { slackWebhookUrl: body.slackWebhookUrl || null }
+          : {})
+      },
+      select: { digestsEnabled: true, slackWebhookUrl: true }
+    });
+
+    response.json({
+      ok: true,
+      digestsEnabled: company.digestsEnabled,
+      slackConfigured: Boolean(company.slackWebhookUrl)
+    });
+  })
+);
+
+adminRouter.post(
+  "/digest/send-now",
+  asyncHandler(async (_request, response) => {
+    const principal = getPrincipal(response);
+    // Ad-hoc digest covering the last 7 days — for testing and catch-up.
+    const periodEnd = new Date();
+    const periodStart = new Date(periodEnd.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const result = await runDigestForCompany(
+      principal.companyId,
+      periodStart,
+      periodEnd,
+      config.webUrl
+    );
+    response.json({ ok: true, ...result });
   })
 );
 

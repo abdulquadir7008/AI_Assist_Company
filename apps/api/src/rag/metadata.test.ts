@@ -66,4 +66,19 @@ describe("buildChunkMetadata", () => {
     expect(metadata.acl_role_HR).toBe(true);
     expect(metadata.acl_role_EMPLOYEE).toBe(false);
   });
+
+  it("writes the owner lane: uploader id, or empty string when unowned", () => {
+    const owned = buildChunkMetadata(document, chunk, {
+      allowedRoles: [Role.ADMIN],
+      allowedDepartments: [],
+      ownerId: "u9"
+    });
+    expect(owned.owner_id).toBe("u9");
+
+    const unowned = buildChunkMetadata(document, chunk, {
+      allowedRoles: [Role.HR],
+      allowedDepartments: []
+    });
+    expect(unowned.owner_id).toBe("");
+  });
 });

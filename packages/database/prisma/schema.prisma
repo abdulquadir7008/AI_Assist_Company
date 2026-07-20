@@ -71,6 +71,14 @@ enum AuditAction {
   USER_CREATE
   PASSWORD_CHANGE
   COMPANY_STATUS_CHANGE
+  CHAT_UPLOAD
+  DIGEST_SENT
+  CONVERSATION_DELETE
+}
+
+enum DocumentSource {
+  ADMIN
+  CHAT
 }
 
 enum CompanyStatus {
@@ -84,10 +92,15 @@ model Company {
   name      String
   slug      String        @unique
   status    CompanyStatus @default(PENDING_VERIFICATION)
+  // Proactive digests: optional Slack incoming-webhook + master toggle.
+  slackWebhookUrl String?
+  digestsEnabled  Boolean  @default(true)
   users     User[]
   documents Document[]
   questions Question[]
   auditLogs AuditLog[]
+  conversations Conversation[]
+  digestRuns    DigestRun[]
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
 }
@@ -101,9 +114,11 @@ model User {
   mustChangePassword Boolean            @default(false)
   roles              Role[]             @default([EMPLOYEE])
   department         Department         @default(GENERAL)
+  digestOptOut       Boolean            @default(false)
   companyId          String
   company            Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
   questions          Question[]
+  conversations      Conversation[]
   verificationCodes  VerificationCode[]
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
@@ -148,6 +163,9 @@ model Document {
   allowedDepartments Department[] @default([])
   classifiedAt       DateTime?
   classifiedById     String?
+  // Chat uploads are private to their uploader (owner lane) until reclassified.
+  ownerId            String?
+  source             DocumentSource @default(ADMIN)
   status          DocumentStatus   @default(UPLOADED)
   failureReason   String?
   chunks          DocumentChunk[]
@@ -178,12 +196,28 @@ model DocumentChunk {
   @@index([documentId])
 }
 
+model Conversation {
+  id        String     @id @default(cuid())
+  companyId String
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  questions Question[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@index([companyId, userId, updatedAt])
+}
+
 model Question {
   id         String     @id @default(cuid())
   companyId  String
   company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
   userId     String?
   user       User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
   provider   AiProvider
   question   String
   answer     String
@@ -191,6 +225,21 @@ model Question {
   createdAt  DateTime   @default(now())
 
   @@index([companyId])
+  @@index([conversationId])
+}
+
+model DigestRun {
+  id            String   @id @default(cuid())
+  companyId     String
+  company       Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  periodStart   DateTime
+  periodEnd     DateTime
+  documentCount Int
+  emailsSent    Int
+  slackSent     Boolean
+  createdAt     DateTime @default(now())
+
+  @@index([companyId, periodEnd])
 }
 
 model AuditLog {

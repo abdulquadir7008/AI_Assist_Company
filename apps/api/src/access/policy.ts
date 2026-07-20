@@ -11,16 +11,19 @@ export type Principal = {
 export type Acl = {
   allowedRoles: Role[];
   allowedDepartments: Department[];
+  /** Chat-upload owner: this user always retains access (owner lane). */
+  ownerId?: string | null;
 };
 
 /**
  * The single access rule for the whole system. ADMIN sees everything;
- * otherwise access is the additive union of the user's roles and department.
+ * otherwise access is the additive union of the user's roles, department,
+ * and ownership (chat uploads stay readable by their uploader).
  * The REST layer calls this directly; the retrieval layer enforces the exact
  * same rule compiled to a Chroma where-filter by buildChromaAccessFilter.
  */
 export function canAccess(
-  principal: Pick<Principal, "roles" | "department">,
+  principal: Pick<Principal, "userId" | "roles" | "department">,
   acl: Acl
 ): boolean {
   if (principal.roles.includes(Role.ADMIN)) {
@@ -28,17 +31,24 @@ export function canAccess(
   }
   return (
     principal.roles.some((role) => acl.allowedRoles.includes(role)) ||
-    acl.allowedDepartments.includes(principal.department)
+    acl.allowedDepartments.includes(principal.department) ||
+    (acl.ownerId != null && acl.ownerId === principal.userId)
   );
 }
 
-/** Chunk-level override wins when set; otherwise the document ACL applies. */
+/** Chunk-level override wins when set; otherwise the document ACL applies.
+ * The owner lane is document-scoped and survives chunk overrides — an
+ * uploader never loses access to part of their own file. */
 export function effectiveChunkAcl(
   documentAcl: Acl,
   chunk: { aclOverride: boolean; overrideRoles: Role[]; overrideDepartments: Department[] }
 ): Acl {
   if (chunk.aclOverride) {
-    return { allowedRoles: chunk.overrideRoles, allowedDepartments: chunk.overrideDepartments };
+    return {
+      allowedRoles: chunk.overrideRoles,
+      allowedDepartments: chunk.overrideDepartments,
+      ownerId: documentAcl.ownerId ?? null
+    };
   }
   return documentAcl;
 }
@@ -50,14 +60,17 @@ export function effectiveChunkAcl(
  * regardless of whether the Chroma server merges or replaces metadata.
  * acl_role_ADMIN is always true: admins can access everything.
  */
-export function aclToChromaFlags(acl: Acl): Record<string, boolean> {
-  const flags: Record<string, boolean> = {};
+export function aclToChromaFlags(acl: Acl): Record<string, boolean | string> {
+  const flags: Record<string, boolean | string> = {};
   for (const role of Object.values(Role)) {
     flags[`acl_role_${role}`] = role === Role.ADMIN || acl.allowedRoles.includes(role);
   }
   for (const department of Object.values(Department)) {
     flags[`acl_dept_${department}`] = acl.allowedDepartments.includes(department);
   }
+  // Owner lane. Chroma metadata cannot store null, so "no owner" is the empty
+  // string — which can never equal a real userId in the $eq clause below.
+  flags.owner_id = acl.ownerId ?? "";
   return flags;
 }
 
@@ -82,6 +95,9 @@ export function buildChromaAccessFilter(principal: Principal): Where | null {
     [`acl_role_${role}`]: { $eq: true }
   }));
   grantClauses.push({ [`acl_dept_${principal.department}`]: { $eq: true } });
+  // Owner lane: chat uploads always stay retrievable by their uploader.
+  // Legacy chunks without owner_id can never match (missing key ≠ value).
+  grantClauses.push({ owner_id: { $eq: principal.userId } });
 
   if (grantClauses.length === 0) {
     return null;

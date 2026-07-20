@@ -46,7 +46,10 @@ const fixtures = {
   // Pre-RBAC chunk: citation metadata but NO acl_* keys at all.
   legacyChunk: { companyId, documentId: "old", title: "Legacy doc" },
   // Same-looking chunk from another tenant.
-  otherCompanyHr: { ...chunkMeta({ allowedRoles: [Role.HR], allowedDepartments: [] }), companyId: "other" }
+  otherCompanyHr: { ...chunkMeta({ allowedRoles: [Role.HR], allowedDepartments: [] }), companyId: "other" },
+  // Chat upload: private to its uploader (owner lane), admin-only otherwise.
+  chatUploadByU: chunkMeta({ allowedRoles: [], allowedDepartments: [], ownerId: "u" }),
+  chatUploadByOther: chunkMeta({ allowedRoles: [], allowedDepartments: [], ownerId: "someone-else" })
 };
 
 function principal(roles: Role[], department: Department): Principal {
@@ -66,28 +69,31 @@ function matchedBy(p: Principal): string[] {
 describe("adversarial: contractor probing for restricted content", () => {
   it("contractor retrieves ZERO chunks from HR/legal/engineering/admin/legacy fixtures", () => {
     const matched = matchedBy(principal([Role.CONTRACTOR], Department.GENERAL));
-    expect(matched).toEqual(["companyWide"]);
+    expect(matched.sort()).toEqual(["chatUploadByU", "companyWide"]);
     expect(matched).not.toContain("hrSalaryBands");
     expect(matched).not.toContain("legalContract");
     expect(matched).not.toContain("adminOnlyUnclassified");
     expect(matched).not.toContain("legacyChunk");
     expect(matched).not.toContain("otherCompanyHr");
+    expect(matched).not.toContain("chatUploadByOther");
   });
 
   it("employee in Engineering additionally reaches engineering department docs", () => {
     const matched = matchedBy(principal([Role.EMPLOYEE], Department.ENGINEERING));
-    expect(matched.sort()).toEqual(["companyWide", "engineeringDocs"]);
+    expect(matched.sort()).toEqual(["chatUploadByU", "companyWide", "engineeringDocs"]);
   });
 
   it("HR reaches HR content but not legal", () => {
     const matched = matchedBy(principal([Role.HR], Department.HR));
-    expect(matched.sort()).toEqual(["companyWide", "hrSalaryBands"]);
+    expect(matched.sort()).toEqual(["chatUploadByU", "companyWide", "hrSalaryBands"]);
   });
 
   it("admin reaches everything in its own company only", () => {
     const matched = matchedBy(principal([Role.ADMIN], Department.LEADERSHIP));
     expect(matched.sort()).toEqual([
       "adminOnlyUnclassified",
+      "chatUploadByOther",
+      "chatUploadByU",
       "companyWide",
       "engineeringDocs",
       "hrSalaryBands",
@@ -95,6 +101,18 @@ describe("adversarial: contractor probing for restricted content", () => {
       "legalContract"
     ]);
     expect(matched).not.toContain("otherCompanyHr");
+  });
+
+  it("owner lane: a user's own chat upload matches, everyone else's never does", () => {
+    // Every non-admin role/department combination reaches its own upload
+    // and never someone else's — the owner lane cannot be widened by roles.
+    for (const role of [Role.HR, Role.LEGAL, Role.MANAGER, Role.EMPLOYEE, Role.CONTRACTOR]) {
+      for (const department of Object.values(Department)) {
+        const matched = matchedBy(principal([role], department));
+        expect(matched).toContain("chatUploadByU");
+        expect(matched).not.toContain("chatUploadByOther");
+      }
+    }
   });
 
   it("legacy chunks (no acl flags) fail closed for every non-admin role", () => {
